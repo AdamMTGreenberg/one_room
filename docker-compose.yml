@@ -1,0 +1,20 @@
+services:
+  oneroom:
+    build: .
+    container_name: oneroom
+    ports:
+      - "7777:7777"
+    volumes:
+      - ./data:/data
+    environment:
+      # Generated on first boot and saved to ./data/oneroom.key if unset.
+      # ONEROOM_KEY: "or_change_me"
+      ONEROOM_MAX_DB_MB: "256"
+      ONEROOM_MAX_MESSAGE_KB: "64"
+      ONEROOM_MAX_DOC_KB: "512"
+      ONEROOM_RETENTION_DAYS: "0" # 0 = unlimited; N hides (never deletes) messages older than N days
+    # The container itself is bounded, per the design: memory, CPU, pids.
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped

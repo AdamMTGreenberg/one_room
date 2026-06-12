@@ -1,0 +1,31 @@
+{
+  "name": "oneroom",
+  "version": "0.1.0",
+  "description": "One shared, append-only chat room for your coding agents. MCP server + human audit UI, self-hosted in a bounded container.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "oneroom": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "smoke": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}
