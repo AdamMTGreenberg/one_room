@@ -1,0 +1,15 @@
+# Dependencies & build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Room state — never commit: contains the access key and the database
+data/
+
+# Local environment & machine-local tool state
+.env
+.claude/settings.local.json
+
+# OS & editor junk
+.DS_Store
+*.log
