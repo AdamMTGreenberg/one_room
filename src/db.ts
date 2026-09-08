@@ -1,3 +1,8 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import { migrate, SCHEMA_VERSION } from "./migrations.js";
+import { ReadModel } from "./reads.js";
+import { z } from "zod";
 import Database from "better-sqlite3";
 import type { Config } from "./config.js";
 
@@ -31,73 +36,25 @@ export interface DocumentMeta {
   annotations: Annotation[];
 }
 
-const SCHEMA = `
-PRAGMA journal_mode = WAL;
-
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  agent TEXT NOT NULL,
-  content TEXT NOT NULL,
-  reply_to INTEGER REFERENCES messages(id)
-);
-
-CREATE TRIGGER IF NOT EXISTS messages_no_update BEFORE UPDATE ON messages
-BEGIN SELECT RAISE(ABORT, 'oneroom: messages are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS messages_no_delete BEFORE DELETE ON messages
-BEGIN SELECT RAISE(ABORT, 'oneroom: messages are append-only'); END;
-
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-  content, agent, content='messages', content_rowid='id'
-);
-CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
-BEGIN INSERT INTO messages_fts(rowid, content, agent) VALUES (new.id, new.content, new.agent); END;
-
-CREATE TABLE IF NOT EXISTS annotations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  agent TEXT NOT NULL,
-  message_id INTEGER REFERENCES messages(id),
-  document_name TEXT,
-  flag TEXT NOT NULL CHECK (flag IN ('read-first','stale','outdated','failed','resolved','note')),
-  note TEXT,
-  CHECK (message_id IS NOT NULL OR document_name IS NOT NULL)
-);
-
-CREATE TRIGGER IF NOT EXISTS annotations_no_update BEFORE UPDATE ON annotations
-BEGIN SELECT RAISE(ABORT, 'oneroom: annotations are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS annotations_no_delete BEFORE DELETE ON annotations
-BEGIN SELECT RAISE(ABORT, 'oneroom: annotations are append-only'); END;
-
-CREATE TABLE IF NOT EXISTS documents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  agent TEXT NOT NULL,
-  name TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  mime TEXT NOT NULL DEFAULT 'text/markdown',
-  content TEXT NOT NULL,
-  UNIQUE (name, version)
-);
-
-CREATE TRIGGER IF NOT EXISTS documents_no_update BEFORE UPDATE ON documents
-BEGIN SELECT RAISE(ABORT, 'oneroom: documents are append-only; store a new version instead'); END;
-CREATE TRIGGER IF NOT EXISTS documents_no_delete BEFORE DELETE ON documents
-BEGIN SELECT RAISE(ABORT, 'oneroom: documents are append-only'); END;
-
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-  name, content, content='documents', content_rowid='id'
-);
-CREATE TRIGGER IF NOT EXISTS documents_fts_ai AFTER INSERT ON documents
-BEGIN INSERT INTO documents_fts(rowid, name, content) VALUES (new.id, new.name, new.content); END;
-`;
 
 export class Room {
   private db: Database.Database;
+  readonly reads: ReadModel;
 
   constructor(private cfg: Config) {
     this.db = new Database(cfg.dbPath);
-    this.db.exec(SCHEMA);
+    try {
+      // Apply additive schema changes before enforcing the write cap so existing
+      // rooms can still be opened and exported when a lowered cap is exceeded.
+      migrate(this.db);
+      const pageSize = this.db.pragma("page_size", { simple: true }) as number;
+      this.db.pragma(`max_page_count = ${Math.max(1, Math.floor(cfg.maxDbBytes / pageSize))}`);
+      this.db.pragma("journal_size_limit = 4194304");
+      this.reads = new ReadModel(this.db, cfg);
+    } catch (e) {
+      this.db.close();
+      throw e;
+    }
   }
 
   close(): void {
@@ -113,12 +70,76 @@ export class Room {
   }
 
   private assertCapacity(incomingBytes: number): void {
+    const disk = fs.statfsSync(this.cfg.dataDir);
+    if (disk.bavail * disk.bsize < (this.cfg.minFreeDiskBytes ?? 0)) {
+      throw new Error("oneroom: free disk reserve reached; free space or relocate the room before writing");
+    }
     if (this.dbSizeBytes() + incomingBytes > this.cfg.maxDbBytes) {
       throw new Error(
         `oneroom: database size limit reached (${Math.round(this.cfg.maxDbBytes / 1024 / 1024)} MB). ` +
           `Writes are rejected to honor the storage bound. Raise ONEROOM_MAX_DB_MB or start a new room.`
       );
     }
+  }
+
+  private write<T>(incomingBytes: number, action: () => T): T {
+    try {
+      return this.db.transaction(() => {
+        this.assertCapacity(incomingBytes);
+        const result = action();
+        this.assertCapacity(0);
+        return result;
+      }).immediate();
+    } catch (e) {
+      if (e instanceof Error && "code" in e && e.code === "SQLITE_FULL") {
+        throw new Error("oneroom: database size limit reached; raise ONEROOM_MAX_DB_MB or start a new room (also check free disk space).");
+      }
+      throw e;
+    }
+  }
+
+  idempotent<T>(principal: string, requestId: string, operation: string, args: unknown, action: () => T): T {
+    z.string().min(1).max(128).regex(/^[a-zA-Z0-9_.:-]+$/).parse(requestId);
+    const canonical = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(canonical);
+      if (value && typeof value === "object") return Object.fromEntries(
+        Object.entries(value).filter(([, v]) => v !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)]));
+      return value;
+    };
+    const fingerprint = createHash("sha256").update(JSON.stringify([operation, canonical(args)])).digest("hex");
+    // Check replay before capacity checks: retries of committed operations must
+    // remain available even when the room fills up after the original write.
+    return this.db.transaction(() => {
+      const previous = this.db.prepare("SELECT fingerprint, response FROM requests WHERE principal = ? AND request_id = ?")
+        .get(principal, requestId) as { fingerprint: string; response: string } | undefined;
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new Error("oneroom: request_id was already used for a different operation or payload");
+        return JSON.parse(previous.response) as T;
+      }
+      return this.write(0, () => {
+        const result = action();
+        this.db.prepare("INSERT INTO requests(principal, request_id, fingerprint, response) VALUES (?, ?, ?, ?)")
+          .run(principal, requestId, fingerprint, JSON.stringify(result));
+        return result;
+      });
+    }).immediate();
+  }
+
+  operationalStatus() {
+    const disk = fs.statfsSync(this.cfg.dataDir);
+    const size = (suffix: string) => { try { return fs.statSync(this.cfg.dbPath + suffix).size; } catch { return 0; } };
+    const dbBytes = this.dbSizeBytes();
+    const freeBytes = disk.bavail * disk.bsize;
+    return {
+      schema_version: SCHEMA_VERSION, db_bytes: dbBytes, max_db_bytes: this.cfg.maxDbBytes,
+      wal_bytes: size("-wal"), shm_bytes: size("-shm"), disk_free_bytes: freeBytes,
+      disk_reserve_bytes: this.cfg.minFreeDiskBytes ?? 0,
+      warnings: [
+        ...(dbBytes >= this.cfg.maxDbBytes * 0.8 ? ["database_capacity"] : []),
+        ...(freeBytes < Math.max((this.cfg.minFreeDiskBytes ?? 0) * 2, this.cfg.maxDbBytes) ? ["disk_capacity"] : []),
+        ...(size("-wal") > this.cfg.maxDbBytes ? ["wal_growth"] : []),
+      ],
+    };
   }
 
   /** ISO cutoff before which messages are considered archived, or null if retention is unlimited. */
@@ -130,6 +151,8 @@ export class Room {
   // ---- messages -----------------------------------------------------------
 
   postMessage(agent: string, content: string, replyTo?: number): Message {
+    z.string().min(1).max(64).refine(value => value.trim().length > 0).parse(agent);
+    z.string().min(1).parse(content);
     const bytes = Buffer.byteLength(content, "utf8");
     if (bytes > this.cfg.maxMessageBytes) {
       throw new Error(
@@ -137,14 +160,14 @@ export class Room {
           `Store large content as a document and post a summary instead.`
       );
     }
-    this.assertCapacity(bytes);
+    z.number().int().positive().safe().optional().parse(replyTo);
     if (replyTo !== undefined) {
       const parent = this.db.prepare("SELECT id FROM messages WHERE id = ?").get(replyTo);
       if (!parent) throw new Error(`oneroom: reply_to message ${replyTo} does not exist`);
     }
-    const info = this.db
+    const info = this.write(bytes, () => this.db
       .prepare("INSERT INTO messages (agent, content, reply_to) VALUES (?, ?, ?)")
-      .run(agent, content, replyTo ?? null);
+      .run(agent, content, replyTo ?? null));
     return this.getMessage(Number(info.lastInsertRowid))!;
   }
 
@@ -179,12 +202,13 @@ export class Room {
       params.push(cutoff);
     }
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    // Newest window, returned in chronological order.
+    // Poll forward from the cursor without skipping the oldest unread messages.
+    // With no afterId, select the newest window, still returned chronologically.
     const rows = this.db
       .prepare(
         `SELECT id, ts, agent, content, reply_to FROM (
            SELECT id, ts, agent, content, reply_to FROM messages ${whereSql}
-           ORDER BY id DESC LIMIT ?
+           ORDER BY id ${opts.afterId !== undefined ? "ASC" : "DESC"} LIMIT ?
          ) ORDER BY id ASC`
       )
       .all(...params, limit) as Omit<Message, "annotations">[];
@@ -196,17 +220,17 @@ export class Room {
   private annotationsForMessage(messageId: number): Annotation[] {
     return this.db
       .prepare(
-        "SELECT id, ts, agent, flag, note FROM annotations WHERE message_id = ? ORDER BY id ASC"
+        "SELECT id, ts, agent, flag, note FROM annotations WHERE message_id = ? ORDER BY id ASC LIMIT 100"
       )
       .all(messageId) as Annotation[];
   }
 
-  private annotationsForDocument(name: string): Annotation[] {
+  private annotationsForDocument(name: string, version?: number): Annotation[] {
     return this.db
       .prepare(
-        "SELECT id, ts, agent, flag, note FROM annotations WHERE document_name = ? ORDER BY id ASC"
+        "SELECT id, ts, agent, flag, note FROM annotations WHERE document_name = ? AND (document_version IS NULL OR document_version = ?) ORDER BY id ASC LIMIT 100"
       )
-      .all(name) as Annotation[];
+      .all(name, version ?? this.latestDocumentRow(name)?.version ?? null) as Annotation[];
   }
 
   annotate(opts: {
@@ -215,7 +239,20 @@ export class Room {
     note?: string;
     messageId?: number;
     documentName?: string;
+    documentVersion?: number;
   }): Annotation {
+    z.string().min(1).max(64).refine(value => value.trim().length > 0).parse(opts.agent);
+    z.enum(FLAGS).parse(opts.flag);
+    z.string().min(1).max(200).optional().parse(opts.documentName);
+    z.number().int().positive().safe().optional().parse(opts.messageId);
+    z.string().optional().parse(opts.note);
+    z.number().int().nonnegative().safe().optional().parse(opts.documentVersion);
+    if (opts.documentVersion === 0 && opts.flag !== "resolved") throw new Error("document_version 0 is only for resolving legacy name-wide pins");
+    if (opts.messageId !== undefined && opts.documentVersion !== undefined) throw new Error("document_version requires a document target");
+    const targetVersion = opts.documentName === undefined ? null : opts.documentVersion === 0 ? null : opts.documentVersion ?? this.latestDocumentRow(opts.documentName)?.version;
+    if (opts.documentName !== undefined && !this.getDocument(opts.documentName, targetVersion ?? undefined)) throw new Error("document version does not exist");
+    const noteBytes = Buffer.byteLength(opts.note ?? "", "utf8");
+    if (noteBytes > this.cfg.maxMessageBytes) throw new Error("oneroom: annotation note exceeds message size limit");
     if ((opts.messageId === undefined) === (opts.documentName === undefined)) {
       throw new Error("oneroom: annotate exactly one target — message_id or document_name");
     }
@@ -225,12 +262,11 @@ export class Room {
     if (opts.documentName !== undefined && !this.latestDocumentRow(opts.documentName)) {
       throw new Error(`oneroom: document "${opts.documentName}" does not exist`);
     }
-    this.assertCapacity(Buffer.byteLength(opts.note ?? "", "utf8"));
-    const info = this.db
+    const info = this.write(noteBytes, () => this.db
       .prepare(
-        "INSERT INTO annotations (agent, message_id, document_name, flag, note) VALUES (?, ?, ?, ?, ?)"
+        "INSERT INTO annotations (agent, message_id, document_name, flag, note, document_version) VALUES (?, ?, ?, ?, ?, ?)"
       )
-      .run(opts.agent, opts.messageId ?? null, opts.documentName ?? null, opts.flag, opts.note ?? null);
+      .run(opts.agent, opts.messageId ?? null, opts.documentName ?? null, opts.flag, opts.note ?? null, targetVersion));
     return this.db
       .prepare("SELECT id, ts, agent, flag, note FROM annotations WHERE id = ?")
       .get(Number(info.lastInsertRowid)) as Annotation;
@@ -267,32 +303,33 @@ export class Room {
   }
 
   storeDocument(agent: string, name: string, content: string, mime?: string): DocumentMeta {
+    z.string().min(1).max(64).refine(value => value.trim().length > 0).parse(agent);
+    z.string().min(1).parse(content);
     const bytes = Buffer.byteLength(content, "utf8");
     if (bytes > this.cfg.maxDocBytes) {
       throw new Error(
         `oneroom: document is ${bytes} bytes; limit is ${this.cfg.maxDocBytes} (ONEROOM_MAX_DOC_KB).`
       );
     }
-    this.assertCapacity(bytes);
-    const insert = this.db.transaction(() => {
+    z.string().min(1).max(200).refine(value => value.trim().length > 0).parse(name);
+    z.string().min(1).max(255).regex(/^[^\r\n]+$/).optional().parse(mime);
+    return this.write(bytes, () => {
       const latest = this.latestDocumentRow(name);
       const version = (latest?.version ?? 0) + 1;
       this.db
         .prepare("INSERT INTO documents (agent, name, version, mime, content) VALUES (?, ?, ?, ?, ?)")
         .run(agent, name, version, mime ?? latest?.mime ?? "text/markdown", content);
-      return version;
+      const row = this.latestDocumentRow(name)!;
+      return {
+        name: row.name,
+        version,
+        mime: row.mime,
+        agent: row.agent,
+        ts: row.ts,
+        bytes,
+        annotations: this.annotationsForDocument(name),
+      };
     });
-    const version = insert();
-    const row = this.latestDocumentRow(name)!;
-    return {
-      name: row.name,
-      version,
-      mime: row.mime,
-      agent: row.agent,
-      ts: row.ts,
-      bytes,
-      annotations: this.annotationsForDocument(name),
-    };
   }
 
   getDocument(name: string, version?: number): { meta: DocumentMeta; content: string } | null {
@@ -313,7 +350,7 @@ export class Room {
         agent: row.agent,
         ts: row.ts,
         bytes: Buffer.byteLength(row.content, "utf8"),
-        annotations: this.annotationsForDocument(name),
+        annotations: this.annotationsForDocument(name, row.version),
       },
       content: row.content,
     };
@@ -322,7 +359,7 @@ export class Room {
   listDocuments(): DocumentMeta[] {
     const rows = this.db
       .prepare(
-        `SELECT d.ts, d.agent, d.name, d.version, d.mime, length(d.content) AS bytes
+        `SELECT d.ts, d.agent, d.name, d.version, d.mime, length(CAST(d.content AS BLOB)) AS bytes
          FROM documents d
          JOIN (SELECT name, MAX(version) AS v FROM documents GROUP BY name) m
            ON d.name = m.name AND d.version = m.v
@@ -373,6 +410,7 @@ export class Room {
         `SELECT d.name, MAX(d.version) AS version FROM documents_fts f
          JOIN documents d ON d.id = f.rowid
          WHERE documents_fts MATCH ?
+           AND d.version = (SELECT MAX(latest.version) FROM documents latest WHERE latest.name = d.name)
          GROUP BY d.name ORDER BY MIN(rank) LIMIT ?`,
         [limit]
       ) as { name: string }[];
@@ -387,6 +425,7 @@ export class Room {
   // ---- status ---------------------------------------------------------------
 
   status(): {
+    schema_version: number;
     messages: number;
     documents: number;
     annotations: number;
@@ -400,6 +439,7 @@ export class Room {
     const count = (table: string): number =>
       (this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
     return {
+      schema_version: SCHEMA_VERSION,
       messages: count("messages"),
       documents: count("documents"),
       annotations: count("annotations"),
@@ -410,6 +450,29 @@ export class Room {
       retention_days: this.cfg.retentionDays,
       archived_before: this.retentionCutoff(),
     };
+  }
+
+  *exportChunks(): Generator<string> {
+    const tables = ["messages", "annotations", "documents"] as const;
+    const maxima = tables.map((table) =>
+      (this.db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM ${table}`).get() as { id: number }).id);
+    yield `{"exported_at":${JSON.stringify(new Date().toISOString())},"status":${JSON.stringify(this.status())}`;
+    for (const [index, table] of tables.entries()) {
+      yield `,"${table}":[`;
+      let after = 0;
+      let first = true;
+      while (after < maxima[index]) {
+        // One row at a time bounds memory even with large document versions.
+        const row = this.db.prepare(`SELECT * FROM ${table} WHERE id > ? AND id <= ? ORDER BY id LIMIT 1`)
+          .get(after, maxima[index]) as { id: number } | undefined;
+        if (!row) break;
+        yield `${first ? "" : ","}${JSON.stringify(row)}`;
+        first = false;
+        after = row.id;
+      }
+      yield "]";
+    }
+    yield "}";
   }
 
   exportAll(): unknown {

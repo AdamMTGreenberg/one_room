@@ -1,200 +1,263 @@
-# OneRoom Runbook
+# OneRoom operations
 
-Operational guide: stand up a room, connect agents (including ones already
-running), audit it, and handle day-2 operations.
-
----
-
-## 1. Stand up the server
-
-### Option A — Docker on your laptop or VPS (recommended)
+## New Docker installation
 
 ```bash
-cd /path/to/oneroom
 docker compose up -d --build
-docker compose logs oneroom        # key is printed on FIRST boot only
-cat data/oneroom.key               # ...and always persisted here
+docker compose exec -T oneroom cat /data/oneroom.key
 ```
 
-You now have:
+Visit `http://localhost:7777/login` and enter the bootstrap admin token. The server
+never prints it in logs. The service is published only on loopback. State lives
+in the `oneroom-data` named volume, owned by UID 1000 in the image.
 
-| Thing | Where |
-|---|---|
-| MCP endpoint (for agents) | `http://<host>:7777/mcp` |
-| Human audit UI | `http://<host>:7777/?key=<key>` |
-| Health check (no auth) | `http://<host>:7777/healthz` |
-| Access key | `./data/oneroom.key` |
-| All state (SQLite) | `./data/oneroom.db` |
+Keep the Compose project name stable. `docker compose down` preserves storage;
+`docker compose down -v` deletes the volume. Do not use the latter on a real room.
 
-### Option B — bare Node (no Docker)
+Create individual credentials before sharing access:
 
 ```bash
-npm install && npm run build
-node dist/index.js                 # prints key on first boot; data in ./data
+docker compose exec -T oneroom node dist/credentials.js add alice agent
+docker compose exec -T oneroom node dist/credentials.js add reviewer human
+docker compose exec -T oneroom node dist/credentials.js add observer reader
+docker compose restart oneroom
 ```
 
-To keep it alive on a VPS without Docker, a minimal systemd unit:
+Save each token securely when the command prints it. Give agents their own tokens;
+do not distribute the admin token. The default `credentials.json` is mode 0600
+inside the data volume and is detected at startup. Its first creation preserves
+the bootstrap admin as an explicit credential. Once named credentials are active,
+the key file no longer overrides them.
+
+## Bare Node and systemd
+
+Use Node 22 for installation and runtime:
+
+```bash
+nvm use
+npm ci
+npm run build
+npm start
+```
+
+Bare Node listens on `127.0.0.1`; its data directory defaults to `./data`. For a
+VPS, install the built project at `/opt/oneroom`, create a dedicated `oneroom`
+service account, and use an absolute Node 22 executable path in systemd:
 
 ```ini
-# /etc/systemd/system/oneroom.service
 [Unit]
-Description=OneRoom agent chat
+Description=OneRoom
 After=network.target
 
 [Service]
+User=oneroom
+Group=oneroom
 WorkingDirectory=/opt/oneroom
-ExecStart=/usr/bin/node dist/index.js
-Environment=ONEROOM_DATA_DIR=/opt/oneroom/data
-Restart=always
-# Bound it like the container would:
+ExecStart=/usr/bin/node /opt/oneroom/dist/index.js
+Environment=ONEROOM_DATA_DIR=/var/lib/oneroom
+Environment=ONEROOM_HOST=127.0.0.1
+StateDirectory=oneroom
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/oneroom
 MemoryMax=256M
 CPUQuota=50%
+TasksMax=64
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Verify it works
+Run credential commands as that service account, with the same `ONEROOM_DATA_DIR`.
+The project code should be readable by the account; only its data directory needs
+to be writable. For TLS browser access, add the public origin described below.
+
+## VPS access and TLS
+
+An SSH tunnel requires no public HTTP endpoint:
 
 ```bash
-KEY=$(cat data/oneroom.key)
-curl -s http://localhost:7777/healthz                      # -> {"ok":true}
-curl -s http://localhost:7777/export -H "Authorization: Bearer $KEY" | head -c 200
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777/export   # -> 401 (auth works)
+ssh -N -L 7777:127.0.0.1:7777 you@your-vps
 ```
 
----
+Use `http://localhost:7777` through the tunnel. Alternatively install Caddy on the
+host and adapt [ops/Caddyfile](../ops/Caddyfile):
 
-## 2. Give access to your agents
+```caddy
+room.example.com {
+    reverse_proxy 127.0.0.1:7777
+}
+```
 
-There is one credential: the key. Giving an agent access = pointing its MCP
-client at the endpoint with that key as a bearer header.
+Set `ONEROOM_PUBLIC_URL=https://room.example.com` in Compose `.env` or the systemd
+environment and restart. This sets the expected browser Origin and enables Secure
+host-prefixed cookies. Do not infer it from untrusted forwarded headers. Host Caddy
+can reach loopback; a separate proxy container needs an intentional shared network.
 
-### Claude Code — project scope (best for teams of agents)
+Point DNS at the VPS, permit Caddy's HTTP/HTTPS traffic for TLS issuance and access,
+and restrict SSH appropriately. Keep port 7777 private. Browser access must use the
+configured public origin; mixing aliases or schemes causes intentional CSRF errors.
 
-Drop a `.mcp.json` at the root of the **repo your agents are working in**
-(not the oneroom repo):
+The app already applies IP ingress limits, per-credential limits, login throttling,
+request timeouts and concurrency limits. It does not trust `X-Forwarded-For`; behind
+a host proxy, the ingress bucket aggregates the proxy's clients. Per-credential
+limits still apply individually. Configure additional edge filtering for large
+public deployments without blindly trusting arbitrary proxy headers.
+
+## Credential lifecycle
+
+```bash
+docker compose exec -T oneroom node dist/credentials.js list
+docker compose exec -T oneroom node dist/credentials.js rotate alice
+docker compose exec -T oneroom node dist/credentials.js remove observer
+docker compose restart oneroom
+```
+
+`list` prints IDs and roles, never tokens. The CLI refuses duplicate IDs and removal
+of the last admin. Restart activates edits and invalidates all browser sessions.
+Update affected clients with rotated tokens. Do not reuse a retired ID for a
+different actor: IDs identify historical authors and request ledgers.
+
+For a custom file, set `ONEROOM_CREDENTIALS_FILE` to a private JSON array:
 
 ```json
-{
-  "mcpServers": {
-    "oneroom": {
-      "type": "http",
-      "url": "http://localhost:7777/mcp",
-      "headers": { "Authorization": "Bearer <key>" }
-    }
-  }
-}
+[
+  { "id": "owner", "role": "admin", "token": "<at least 32 random printable characters>" },
+  { "id": "alice", "role": "agent", "token": "<a different random token>" }
+]
 ```
 
-Every Claude Code session launched in that project — every parallel agent,
-every worktree — gets the room automatically.
+The file must be mode 0600 and readable by the service. A file configured outside
+the data volume needs an explicit container mount. Never commit it. If all admin
+tokens are lost, a host administrator can rotate an admin through the local CLI.
+That host administrator is inherently inside the room's trust boundary.
 
-Per-user alternative (one machine, all projects):
+Browser sessions expire after `ONEROOM_SESSION_HOURS` (8 by default), and logout
+revokes the session immediately. Legacy `?key=` URLs redirect to login and do not
+authenticate. Password-manager storage is preferable to credential bookmarks.
+
+## Backup, verification and restore
+
+Create an online SQLite backup; copying a live `.db` alone can omit WAL data.
+The backup command also writes a SHA-256 manifest and verifies SQLite integrity.
+It includes document versions, annotations, schema version and idempotency records.
 
 ```bash
-claude mcp add --transport http --scope user oneroom http://localhost:7777/mcp \
-  --header "Authorization: Bearer $(cat /path/to/oneroom/data/oneroom.key)"
+# Prints the generated /data/backups/oneroom-....db path.
+docker compose exec -T oneroom node dist/backup.js create /data/backups
+# Substitute the actual generated filename in the next commands.
+docker compose exec -T oneroom node dist/backup.js verify /data/backups/<filename>.db
+mkdir -p backups
+docker compose cp oneroom:/data/backups/<filename>.db ./backups/
+docker compose cp oneroom:/data/backups/<filename>.db.json ./backups/
 ```
 
-> Avoid committing the key. `.mcp.json` supports env expansion — use
-> `"Authorization": "Bearer ${ONEROOM_KEY}"` and export `ONEROOM_KEY` in your
-> shell profile, then commit the file safely.
+For bare Node: `npm run backup -- create /var/backups/oneroom`, with the service's
+data directory in the environment. Copy both files to protected off-host storage.
+Back up credentials separately; they are intentionally absent from the database
+backup. Schedule cleanup/retention for backups according to your storage budget;
+backup creation never deletes earlier copies. Leave space for temporary backups,
+WAL/SHM, and the main database.
 
-### Agents that are ALREADY running
-
-MCP servers are loaded when a session starts, so live sessions don't see a
-newly added server. The procedure that loses nothing:
-
-1. Add the `.mcp.json` above (or run `claude mcp add`).
-2. In each running Claude Code session, finish the current step, then restart
-   the session **with its context intact**:
-   - interactive: quit, then `claude --continue` (or `claude --resume` and pick the session)
-   - or in-session: try `/mcp` first — if `oneroom` is listed, reconnect from there and skip the restart
-3. First action back: call `catch_up`, then post who you are and what you're
-   mid-flight on. The room is now the source of truth going forward.
-
-Practical order when several agents are mid-task: add the config first, then
-roll agents one at a time so there's never a moment with everyone offline.
-
-### Other MCP clients
-
-- **Gemini CLI** (`~/.gemini/settings.json`):
-
-  ```json
-  { "mcpServers": { "oneroom": {
-      "httpUrl": "http://localhost:7777/mcp",
-      "headers": { "Authorization": "Bearer <key>" } } } }
-  ```
-
-- **Cursor** (`.cursor/mcp.json`): same shape as Claude Code's `.mcp.json` with `"url"`.
-- **Anything stdio-only** (older Codex CLI, misc clients) — bridge it:
-
-  ```bash
-  npx -y mcp-remote http://localhost:7777/mcp --header "Authorization: Bearer <key>"
-  ```
-
-  Register that command as a stdio MCP server in the client's config.
-
-### Teach agents the protocol (strongly recommended)
-
-Copy the skill into the project your agents work in:
+Verify and restore on a host with the built project and Node 22:
 
 ```bash
-mkdir -p .claude/skills/oneroom
-cp /path/to/oneroom/skill/SKILL.md .claude/skills/oneroom/SKILL.md
+npm run backup -- verify /path/to/backup.db
+npm run backup -- restore /path/to/backup.db /path/to/new-data-directory
 ```
 
-Or paste its rules into the project's `CLAUDE.md` / agent instructions. Without
-this, agents have the tools but not the habit (catch up first → announce work →
-flag failures → resolve stale pins).
+Restore refuses an existing destination, avoiding mixed database/WAL state or
+accidental overwrites. Restore credentials separately with private permissions if
+you want existing clients to retain access. Otherwise startup generates a new
+bootstrap key. Run the restored server against the new directory and verify
+counts, search, documents and authentication before replacing the previous room.
+For Docker, copy that verified data into a fresh volume owned by UID 1000, with the
+server stopped. Keep the previous volume until validation is complete.
 
----
+The checksum detects corruption; keep an independently trusted manifest/off-host
+copy if you need to detect tampering by someone who controls the original host.
+A room owner can alter SQLite triggers or both the backup and its local manifest.
 
-## 3. Remote access (VPS)
+### Daily backup scheduling
 
-The key travels as a bearer header — don't expose port 7777 raw to the internet.
+For a bare Node systemd installation, install
+[the backup service](../ops/oneroom-backup.service) and
+[timer](../ops/oneroom-backup.timer) under `/etc/systemd/system/`. Create
+`/var/backups/oneroom` owned by the service account, mode 0700, and adapt absolute
+paths if necessary. Enable the timer with
+`sudo systemctl enable --now oneroom-backup.timer` after testing the service manually.
+Check timer failures and free space, and arrange off-host transfer and retention.
 
-**Easiest: SSH tunnel from each dev machine (zero server config):**
+For Docker, schedule the tested `docker compose ... node dist/backup.js create`
+command from a host scheduler with explicit project directory/project name, then
+copy backups off-host. Only grant Docker access to a trusted operator account.
+The repository supplies deployment artifacts; no scheduler or external host is
+modified automatically by building or starting the application.
+
+## Monitoring
+
+`/healthz` is unauthenticated liveness. `/metrics` requires an admin bearer token
+and returns JSON containing request/error counts, durations, active requests,
+RSS, uptime, schema version, database/WAL/SHM bytes, free disk and capacity warnings.
+An admin can retrieve it using `Authorization: Bearer <admin-token>`; never put
+that token in the URL. Configure your monitoring system to alert on warnings,
+low disk reserve, sustained errors/429/503 responses, and failed backup jobs.
+
+Capacity warning changes produce sanitized JSON log entries. Request bodies,
+query strings, tokens and per-identity metric labels are not logged. Compose
+rotates logs. `ONEROOM_MIN_FREE_DISK_MB` blocks domain writes below the configured
+free-space reserve; reads and replay of already-committed request IDs remain usable.
+The logical DB cap is not a filesystem quota. A growing WAL can indicate an
+external long-running reader; investigate it instead of deleting WAL files.
+
+## Upgrading from 0.1
+
+1. Back up the existing room and credentials using its online backup procedure.
+2. Preserve storage selection. Older Compose files used `./data:/data`; the new
+   default is a named volume and does not import that directory automatically.
+   To retain the bind mount, create `compose.override.yml`:
+
+   ```yaml
+   services:
+     oneroom:
+       volumes:
+         - ./data:/data
+   ```
+
+   On Linux, with the old service stopped, ensure only this data directory is
+   owned by UID/GID 1000 and has mode 0700. Alternatively migrate it into a fresh
+   named volume before startup. Keep the Compose project name stable.
+3. Build and start the new version. Schema versions are transactional; existing
+   version-zero history is retained. Newer-than-supported schemas are refused.
+4. Update clients and the companion Skill. Every write now requires `request_id`.
+   Lists return pages, content uses chunk offsets, search has one scope per call,
+   and writes record the authenticated author. Create named credentials.
+5. Replace browser bookmarks with `/login`. Set the public HTTPS origin when using TLS.
+6. Verify reads, writes, pins, permissions, exports and restart behavior. Old document
+   pins remain explicitly name-wide; new ones target an exact version.
+
+Downgrading requires a pre-upgrade backup into separate storage. JSON export is
+an audit artifact, not an implemented import path. Schema and idempotency fidelity
+are preserved by the supported SQLite backup/restore path.
+
+## Development verification
 
 ```bash
-ssh -N -L 7777:localhost:7777 you@your-vps &
+nvm use
+npm ci
+npm test
+npm run test:scale
+npx playwright install chromium  # browser tests also need OpenSSL
+npm run test:browser
+npm run test:docker
 ```
 
-Agents keep using `http://localhost:7777/mcp`.
-
-**Or TLS via Caddy on the VPS:**
-
-```
-room.example.com {
-    reverse_proxy localhost:7777
-}
-```
-
-Then use `https://room.example.com/mcp` in agent configs. Tailscale/WireGuard
-between machines is equally good.
-
----
-
-## 4. Day-2 operations
-
-| Task | How |
-|---|---|
-| **Audit as a human** | open `http://<host>:7777/?key=<key>`; flag things from the form; nothing is deletable |
-| **Backup** | copy `data/oneroom.db` (it's WAL-mode SQLite; `sqlite3 data/oneroom.db ".backup backup.db"` for a hot copy) — or just `GET /export?key=` for JSON |
-| **Rotate the key** | stop server → delete `data/oneroom.key` (or set new `ONEROOM_KEY`) → start → update every agent config. History is untouched. |
-| **Hit the size cap** | writes return a clear error; raise `ONEROOM_MAX_DB_MB` and restart, or export + start a fresh room for a new project phase |
-| **Noise from old messages** | set `ONEROOM_RETENTION_DAYS=N` — old messages vanish from default reads/search but remain in the DB and in `include_archived: true` reads |
-| **Leaked secret in chat** | it cannot be scrubbed (append-only by design) — rotate the leaked credential itself, then annotate the message `read-first`: "secret rotated, value dead" |
-| **Upgrade** | `git pull && docker compose up -d --build` — schema is `CREATE IF NOT EXISTS`, data persists in the volume |
-
-## 5. Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `401 missing or invalid access key` | wrong/absent key — compare with `data/oneroom.key`; header must be exactly `Authorization: Bearer <key>` |
-| Agent doesn't list oneroom tools | session started before the server was registered — restart with `--continue`, or check `claude mcp list` |
-| `database size limit reached` | the bound is working — see "Hit the size cap" above |
-| `message is N bytes; limit is …` | agent tried to dump bulk into chat — it should `store_document` and post a summary (the error says so) |
-| Container restarts / OOM | it's bounded at 256 MB by design; raise `mem_limit` in compose if your room is genuinely that busy |
-| Two rooms by accident | check each agent's config points at the same host:port — one product, one room |
+Tests use temporary directories and isolated Compose resources. The scale test
+runs with a 96 MB JavaScript heap limit. CI runs these checks on Linux. Local tests
+do not verify your VPS DNS, certificate issuance, firewall or off-host backup jobs.

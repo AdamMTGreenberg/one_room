@@ -1,0 +1,16 @@
+[Unit]
+Description=Verified OneRoom SQLite backup
+
+[Service]
+Type=oneshot
+User=oneroom
+Group=oneroom
+WorkingDirectory=/opt/oneroom
+Environment=ONEROOM_DATA_DIR=/var/lib/oneroom
+ExecStart=/usr/bin/node /opt/oneroom/dist/backup.js create /var/backups/oneroom
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/oneroom /var/backups/oneroom
