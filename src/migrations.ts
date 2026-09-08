@@ -90,6 +90,50 @@ CREATE TRIGGER requests_no_update BEFORE UPDATE ON requests
 BEGIN SELECT RAISE(ABORT, 'oneroom: requests are append-only'); END;
 CREATE TRIGGER requests_no_delete BEFORE DELETE ON requests
 BEGIN SELECT RAISE(ABORT, 'oneroom: requests are append-only'); END;
+`, `
+CREATE TABLE room_records (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ kind TEXT NOT NULL, key TEXT NOT NULL, agent TEXT NOT NULL,
+ version INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE(kind,key,version)
+);
+CREATE INDEX room_records_latest ON room_records(kind,key,id DESC);
+CREATE TABLE thread_links (
+ message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+ root_id INTEGER NOT NULL REFERENCES messages(id), question INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX thread_root ON thread_links(root_id,message_id);
+WITH RECURSIVE roots(id,root) AS (
+ SELECT id,id FROM messages WHERE reply_to IS NULL
+ UNION ALL SELECT m.id,r.root FROM messages m JOIN roots r ON m.reply_to=r.id
+) INSERT INTO thread_links(message_id,root_id) SELECT id,root FROM roots;
+CREATE TABLE room_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ agent TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
+ recipient TEXT, question INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX room_events_recipient ON room_events(recipient,id);
+CREATE TABLE attention (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL UNIQUE REFERENCES room_events(id),
+ recipient TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'unread',
+ updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX attention_recipient ON attention(recipient,id);
+CREATE TABLE checkins (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL UNIQUE,
+ interval_seconds INTEGER NOT NULL, last_seen INTEGER NOT NULL, next_due INTEGER NOT NULL,
+ lease_event INTEGER NOT NULL DEFAULT 0, lease_token TEXT, lease_until INTEGER NOT NULL DEFAULT 0, retry_after INTEGER NOT NULL DEFAULT 0,
+ delivered_event INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER room_records_no_update BEFORE UPDATE ON room_records
+BEGIN SELECT RAISE(ABORT,'oneroom: records are versioned'); END;
+CREATE TRIGGER room_records_no_delete BEFORE DELETE ON room_records
+BEGIN SELECT RAISE(ABORT,'oneroom: records are versioned'); END;
+CREATE TRIGGER room_events_no_update BEFORE UPDATE ON room_events
+BEGIN SELECT RAISE(ABORT,'oneroom: events are append-only'); END;
+CREATE TRIGGER room_events_no_delete BEFORE DELETE ON room_events
+BEGIN SELECT RAISE(ABORT,'oneroom: events are append-only'); END;
 `];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

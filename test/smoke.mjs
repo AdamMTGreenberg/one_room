@@ -161,7 +161,7 @@ try {
   const metrics = await fetchAuth(`http://127.0.0.1:${PORT}/metrics`).then(r => r.json());
   assert.ok(metrics.requests > 0);
   assert.ok(metrics.tool_errors > 0);
-  assert.equal(metrics.schema_version, 2);
+  assert.equal(metrics.schema_version, 3);
 
   const base = `http://127.0.0.1:${PORT}`;
   const legacy = await fetch(`${base}/?key=${KEY}`, { redirect: "manual" });

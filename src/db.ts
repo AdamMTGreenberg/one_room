@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { migrate, SCHEMA_VERSION } from "./migrations.js";
+import { Collaboration } from "./collaboration.js";
 import { ReadModel } from "./reads.js";
 import { z } from "zod";
 import Database from "better-sqlite3";
@@ -40,6 +41,7 @@ export interface DocumentMeta {
 export class Room {
   private db: Database.Database;
   readonly reads: ReadModel;
+  readonly collaboration: Collaboration;
 
   constructor(private cfg: Config) {
     this.db = new Database(cfg.dbPath);
@@ -51,6 +53,7 @@ export class Room {
       this.db.pragma(`max_page_count = ${Math.max(1, Math.floor(cfg.maxDbBytes / pageSize))}`);
       this.db.pragma("journal_size_limit = 4194304");
       this.reads = new ReadModel(this.db, cfg);
+      this.collaboration = new Collaboration(this.db, (bytes, action) => this.write(bytes, action), this.reads.budget);
     } catch (e) {
       this.db.close();
       throw e;
@@ -150,7 +153,7 @@ export class Room {
 
   // ---- messages -----------------------------------------------------------
 
-  postMessage(agent: string, content: string, replyTo?: number): Message {
+  postMessage(agent: string, content: string, replyTo?: number, mentions: string[] = [], question = false): Message {
     z.string().min(1).max(64).refine(value => value.trim().length > 0).parse(agent);
     z.string().min(1).parse(content);
     const bytes = Buffer.byteLength(content, "utf8");
@@ -165,9 +168,11 @@ export class Room {
       const parent = this.db.prepare("SELECT id FROM messages WHERE id = ?").get(replyTo);
       if (!parent) throw new Error(`oneroom: reply_to message ${replyTo} does not exist`);
     }
-    const info = this.write(bytes, () => this.db
-      .prepare("INSERT INTO messages (agent, content, reply_to) VALUES (?, ?, ?)")
-      .run(agent, content, replyTo ?? null));
+    const info = this.write(bytes, () => {
+      const info = this.db.prepare("INSERT INTO messages (agent, content, reply_to) VALUES (?, ?, ?)").run(agent, content, replyTo ?? null);
+      this.collaboration.messagePosted(Number(info.lastInsertRowid), agent, content, replyTo, mentions, question);
+      return info;
+    });
     return this.getMessage(Number(info.lastInsertRowid))!;
   }
 
@@ -453,9 +458,9 @@ export class Room {
   }
 
   *exportChunks(): Generator<string> {
-    const tables = ["messages", "annotations", "documents"] as const;
+    const tables = ["messages", "annotations", "documents", "room_records", "room_events", "attention", "checkins", "thread_links"] as const;
     const maxima = tables.map((table) =>
-      (this.db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM ${table}`).get() as { id: number }).id);
+      (this.db.prepare(`SELECT COALESCE(MAX(${table === "thread_links" ? "message_id" : "id"}), 0) AS id FROM ${table}`).get() as { id: number }).id);
     yield `{"exported_at":${JSON.stringify(new Date().toISOString())},"status":${JSON.stringify(this.status())}`;
     for (const [index, table] of tables.entries()) {
       yield `,"${table}":[`;
@@ -463,7 +468,7 @@ export class Room {
       let first = true;
       while (after < maxima[index]) {
         // One row at a time bounds memory even with large document versions.
-        const row = this.db.prepare(`SELECT * FROM ${table} WHERE id > ? AND id <= ? ORDER BY id LIMIT 1`)
+        const row = this.db.prepare(`SELECT *, ${table === "thread_links" ? "message_id" : "id"} AS id FROM ${table} WHERE ${table === "thread_links" ? "message_id" : "id"} > ? AND ${table === "thread_links" ? "message_id" : "id"} <= ? ORDER BY ${table === "thread_links" ? "message_id" : "id"} LIMIT 1`)
           .get(after, maxima[index]) as { id: number } | undefined;
         if (!row) break;
         yield `${first ? "" : ","}${JSON.stringify(row)}`;

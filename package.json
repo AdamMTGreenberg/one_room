@@ -12,7 +12,7 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "smoke": "node test/smoke.mjs",
-    "test": "npm run build && node --test test/regression.mjs && npm run smoke",
+    "test": "npm run build && node --test test/regression.mjs test/collaboration.mjs && npm run smoke",
     "test:docker": "node test/docker.mjs",
     "credentials": "node dist/credentials.js",
     "backup": "node dist/backup.js",
