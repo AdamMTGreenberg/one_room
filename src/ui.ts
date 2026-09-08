@@ -6,7 +6,7 @@ export const esc = (value: unknown) => String(value ?? "").replaceAll("&", "&amp
 const link = (url: string, label: string) => `<a href="${esc(url)}">${esc(label)}</a>`;
 export function layout(body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OneRoom</title>
-<style>body{font:16px/1.5 system-ui;max-width:64rem;margin:2rem auto;padding:0 1rem;background:#f8fafc;color:#1e293b}nav{display:flex;gap:1rem;flex-wrap:wrap}article,form{padding:1rem;background:white;border:1px solid #cbd5e1;margin:1rem 0;border-radius:6px}pre{white-space:pre-wrap;overflow-wrap:anywhere}label{display:block;margin:.5rem 0}input,select,button{font:inherit}a{color:#075985}small{color:#475569}</style></head><body><h1>OneRoom</h1>${body}</body></html>`;
+<style>body{font:16px/1.5 system-ui;max-width:64rem;margin:2rem auto;padding:0 1rem;background:#f8fafc;color:#1e293b}nav{display:flex;gap:1rem;flex-wrap:wrap}article,form{padding:1rem;background:white;border:1px solid #cbd5e1;margin:1rem 0;border-radius:6px}pre{white-space:pre-wrap;overflow-wrap:anywhere}label{display:block;margin:.5rem 0}input,select,button,textarea{font:inherit}textarea{display:block;width:100%;box-sizing:border-box}a{color:#075985}small{color:#475569}</style></head><body><h1>OneRoom</h1>${body}</body></html>`;
 }
 export function renderLogin(csrf: string) {
   return layout(`<h2>Sign in</h2><form method="post" action="/login"><input type="hidden" name="csrf" value="${esc(csrf)}"><label>Access token <input name="token" type="password" autocomplete="current-password" required maxlength="4096"></label><button>Sign in</button></form>`);
@@ -40,7 +40,7 @@ export function renderHome(room: Room, principal: Principal, csrf: string, query
         : link(`/doc/${encodeURIComponent(item.document_name)}${item.document_version ? `?version=${item.document_version}` : ""}`, `${item.document_name} · ${item.document_version ?? "legacy name-wide pin"}`)}</p>
       ${item.target.content ? `<pre>${esc(item.target.content)}</pre>` : ""}</article>`;
     return `<article><small>#${item.id} · ${esc(item.agent)} · ${esc(item.ts)}</small><pre>${esc(item.content)}</pre>
-      ${item.content_truncated ? "<p>Content preview</p>" : ""}${link(`/message/${item.id}`, "Full message")} ·
+      ${item.content_truncated ? "<p>Content preview</p>" : ""}${link(`/message/${item.id}`, "Full message")} · ${link(`/boards?view=thread&message_id=${item.id}`, "Thread")} ·
       ${link(`/?view=annotations&message_id=${item.id}`, `Annotations${item.annotations.has_more ? " (more available)" : ""}`)}</article>`;
   }).join("");
   const nextQuery = new URLSearchParams(query);
@@ -53,7 +53,7 @@ export function renderHome(room: Room, principal: Principal, csrf: string, query
     <label>Document version (blank = latest; 0 only resolves legacy pins) <input name="document_version" type="number" min="0"></label>
     <label for="flag">Flag</label><select id="flag" name="flag"><option>read-first</option><option>resolved</option><option>stale</option><option>outdated</option><option>failed</option><option>note</option></select>
     <label>Note <input name="note" maxlength="10000"></label><button>Annotate as ${esc(principal.id)}</button></form>` : "";
-  return layout(`<nav>${link("/", "Chat")}${link("/?view=pins", "Read first pins")}${link("/?view=documents", "Documents")}${link("/?view=annotations", "Annotation history")}${allowed(principal, "export") ? link("/export", "Export JSON") : ""}</nav>
+  return layout(`<nav>${link("/boards", "Collaboration boards")}${link("/", "Chat")}${link("/?view=pins", "Read first pins")}${link("/?view=documents", "Documents")}${link("/?view=annotations", "Annotation history")}${allowed(principal, "export") ? link("/export", "Export JSON") : ""}</nav>
     <p>Signed in as ${esc(principal.id)} (${esc(principal.role)})</p><h2>${esc(view)}</h2>
     ${view === "messages" ? link(`/?include_archived=${!archive}`, archive ? "Hide archived" : "Include archived") : ""}
     ${cards || "<p>No items.</p>"}${page.has_more ? link(`/?${nextQuery}`, "Next page — more items remain") : "<p>End of results.</p>"}

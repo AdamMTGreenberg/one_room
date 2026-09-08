@@ -9,7 +9,7 @@ export type Permission = "read" | "post" | "annotate" | "document" | "export" | 
 const permissions: Record<Role, Permission[]> = {
   admin: ["read", "post", "annotate", "document", "export", "metrics"],
   agent: ["read", "post", "annotate", "document"],
-  human: ["read", "annotate", "export"],
+  human: ["read", "post", "annotate", "export"],
   reader: ["read"],
 };
 export function allowed(principal: Principal, action: Permission): boolean { return permissions[principal.role].includes(action); }
@@ -45,6 +45,7 @@ export class Auth {
       this.credentials = [{ principal: { id: "admin", role: "admin" }, hash: digest(cfg.key) }];
     }
   }
+  principals(): Principal[] { return this.credentials.map(c => ({ ...c.principal })); }
   authenticate(token: unknown): Principal | null {
     if (typeof token !== "string" || !token || token.length > 4096) return null;
     const hash = digest(token);

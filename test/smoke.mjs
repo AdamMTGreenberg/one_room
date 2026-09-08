@@ -61,7 +61,7 @@ try {
 
   const call = async (client, name, args) => {
     called.add(name);
-    const res = await client.callTool({ name, arguments: ["post_message", "annotate", "store_document"].includes(name) ? { request_id: randomUUID(), ...args } : args });
+    const res = await client.callTool({ name, arguments: (["post_message", "annotate", "store_document", "check_in"].includes(name) || name.startsWith("update_")) ? { request_id: randomUUID(), ...args } : args });
     assert.ok(!res.isError, `${name} errored: ${res.content?.[0]?.text}`);
     return JSON.parse(res.content[0].text);
   };
@@ -82,7 +82,7 @@ try {
   const bob = await connect();
 
   const tools = await alice.listTools();
-  assert.equal(tools.tools.length, 13, "expected 13 tools");
+  assert.equal(tools.tools.length, 27, "expected 27 tools");
 
   const m1 = await call(alice, "post_message", {
     agent: "alice",
@@ -224,6 +224,26 @@ try {
   assert.equal(logout.status, 303);
   assert.equal((await browser(`${base}/export`)).status, 401);
 
+  const agents=await call(alice,"list_agents",{});assert.ok(agents.items.some(a=>a.id==="reviewer"));
+  assert.equal((await call(alice,"read_thread",{message_id:m2.id})).root_id,m1.id);
+  const inbox=await call(alice,"read_inbox",{});assert.equal(inbox.items.length,1);
+  await call(alice,"update_attention",{attention_id:inbox.items[0].id,state:"answered"});
+  await call(alice,"update_status",{key:"alice",expected_version:0,data:{summary:"Building boards",state:"working",detail:"Progress"}});
+  const statusRecord=await call(alice,"get_record",{kind:"status",key:"alice"});assert.equal(JSON.parse(statusRecord.content).summary,"Building boards");
+  assert.equal((await call(alice,"list_records",{kind:"status"})).items.length,1);
+  await call(alice,"update_work",{key:"boards",expected_version:0,data:{title:"Build boards",state:"working",lease_until:Date.now()+60000}});
+  await call(alice,"update_test",{key:"smoke",expected_version:0,data:{repo:"org/repo",commit:"a".repeat(40),suite:"smoke",command:"npm test",state:"passed",started_at:new Date().toISOString(),summary:"Passed"}});
+  await call(alice,"update_log",{key:"smoke-output",expected_version:0,data:{level:"info",summary:"Test output",output:"All passed"}});
+  called.add("update_pr_note");
+  assert.ok((await alice.callTool({name:"update_pr_note",arguments:{request_id:randomUUID(),key:"org/repo#1",expected_version:0,data:{summary:"No provider PR yet"}}})).isError);
+  await call(alice,"check_in",{interval_seconds:300});
+  assert.equal((await call(alice,"list_checkins",{})).items[0].agent,"alice");
+  assert.ok((await call(alice,"read_events",{})).items.length>0);
+  for(const view of ["status","work","pr","test","log","inbox","events","checkins","thread"]) {
+    const response=await fetchAuth(`${base}/boards?view=${view}&message_id=1`);
+    assert.equal(response.status,200,view);assert.ok((await response.text()).length<262144);
+  }
+  assert.equal((await fetchAuth(`${base}/record/status/alice`)).status,200);
   assert.deepEqual([...called].sort(), tools.tools.map(t => t.name).sort(), "every tool was exercised");
   console.log("\nSMOKE OK — all assertions passed");
   await cleanup(0);

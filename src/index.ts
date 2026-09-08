@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { renderBoards } from "./boards-ui.js";
+import type { RecordKind } from "./collaboration.js";
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import express from "express";
@@ -14,6 +16,7 @@ import { Operations, RateLimiter } from "./operations.js";
 const cfg = loadConfig();
 const auth = new Auth(cfg);
 const room = new Room(cfg);
+room.collaboration.setMembers(auth.principals());
 const ops = new Operations();
 const ingress = new RateLimiter((cfg.ratePerMinute ?? 120) * 10);
 const requests = new RateLimiter(cfg.ratePerMinute ?? 120);
@@ -40,7 +43,7 @@ const loginCookie = secure ? "__Host-oneroom-login" : "oneroom-login";
 const cookieOptions = { httpOnly: true, secure, sameSite: "strict" as const, path: "/" };
 const cookie = (req: express.Request, name: string) => req.headers.cookie?.split(";").map(v => v.trim()).find(v => v.startsWith(`${name}=`))?.slice(name.length + 1);
 const sameOrigin = (req: express.Request) => req.headers.origin === (cfg.publicUrl ?? `http://${req.headers.host}`);
-const formParser = express.urlencoded({ extended: false, limit: "256kb", parameterLimit: 12 });
+const formParser = express.urlencoded({ extended: false, limit: "256kb", parameterLimit: 32 });
 app.get("/login", (_req, res) => {
   const csrf = randomBytes(32).toString("base64url");
   res.cookie(loginCookie, csrf, { ...cookieOptions, maxAge: 600000 });
@@ -103,7 +106,7 @@ app.post("/mcp", async (req, res) => {
   }
 });
 app.all("/mcp", (_req, res) => res.set("Allow", "POST").status(405).json({ error: "Method not allowed" }));
-function permit(permission: "annotate" | "export" | "metrics"): express.RequestHandler {
+function permit(permission: "annotate" | "export" | "metrics" | "post"): express.RequestHandler {
   return (_req, res, next) => {
     if (!allowed(res.locals.principal as Principal, permission)) { res.status(403).json({ error: "permission denied" }); return; }
     next();
@@ -114,6 +117,46 @@ app.get("/", (req, res) => {
   const html = renderHome(room, res.locals.principal, res.locals.session?.csrf ?? "", query);
   if (Buffer.byteLength(html) > room.reads.budget) throw new Error("UI response exceeds configured budget");
   res.type("html").send(html);
+});
+app.get("/boards", (req,res) => {
+  const html=renderBoards(room,res.locals.principal,res.locals.session?.csrf ?? "",z.record(z.string().max(1000)).parse(req.query));
+  if(Buffer.byteLength(html)>room.reads.budget) throw new Error("oneroom: page exceeds response budget");
+  res.type("html").send(html);
+});
+app.post("/message",permit("post"),(req,res)=>{
+  const a=z.object({request_id:z.string(),content:z.string().min(1),reply_to:z.string().optional(),mentions:z.string().default(""),question:z.enum(["yes","no"]).default("no"),csrf:z.string().optional()}).strict().parse(req.body);
+  const payload={content:a.content,reply_to:a.reply_to ? Number(a.reply_to) : undefined,mentions:a.mentions.split(",").map(s=>s.trim()).filter(Boolean),question:a.question==="yes"};
+  const message=room.idempotent(res.locals.principal.id,a.request_id,"post_message",payload,()=>{
+    const m=room.postMessage(res.locals.principal.id,payload.content,payload.reply_to,payload.mentions,payload.question);return {id:m.id};
+  });
+  res.redirect(303,`/boards?view=thread&message_id=${message.id}`);
+});
+app.post("/attention",permit("post"),(req,res)=>{
+  const a=z.object({request_id:z.string(),attention_id:z.coerce.number().int().positive(),state:z.enum(["acknowledged","answered","resolved"]),csrf:z.string().optional()}).strict().parse(req.body);
+  room.idempotent(res.locals.principal.id,a.request_id,"update_attention",{id:a.attention_id,state:a.state},()=>room.collaboration.attention(res.locals.principal.id,a.attention_id,a.state));
+  res.redirect(303,"/boards?view=inbox");
+});
+app.post("/record",permit("post"),(req,res)=>{
+  const a=z.record(z.string()).parse(req.body);
+  const kind=z.enum(["status","work","test","log","pr_note"]).parse(a.kind);
+  const lines=(key:string)=>(a[key]??"").split("\n").map(s=>s.trim()).filter(Boolean);
+  const fields=(keys:string[])=>Object.fromEntries(keys.map(key=>[key,a[key]??""]));
+  const data=kind==="status" ? fields(["summary","detail","state","task","repo","branch","worktree","blockers"])
+    :kind==="work" ? {...fields(["title","state","repo","branch","blockers"]),areas:lines("areas"),depends_on:lines("depends_on"),lease_until:Date.now()+z.coerce.number().min(0).max(1440).parse(a.lease_minutes)*60000}
+    :kind==="test" ? {...fields(["repo","commit","suite","command","state","started_at","summary"]),...(a.state!=="running" ? {finished_at:new Date().toISOString()}:{}),artifacts:lines("artifacts")}
+    :kind==="log" ? {...fields(["level","summary","output","repo","work_key"]),artifacts:lines("artifacts")}
+    :fields(["summary","detail"]);
+  const expected=Number(a.expected_version);
+  // Hash the stable form, not derived timestamps, so browser retries replay exactly.
+  const {csrf:_csrf,request_id:_request,...payload}=a;
+  room.idempotent(res.locals.principal.id,a.request_id,"form_record",payload,()=>room.collaboration.put(res.locals.principal.id,kind,a.key,data,expected));
+  res.redirect(303,`/boards?view=${kind}`);
+});
+app.get("/record/:kind/:key",(req,res)=>{
+  const kind=z.enum(["status","work","test","log","pr","pr_note"]).parse(req.params.kind);
+  const result=room.collaboration.content(kind,req.params.key,Number(req.query.offset ?? 0),req.query.version===undefined ? undefined : Number(req.query.version));
+  if(!result){res.status(404).send("not found");return;}
+  res.type("html").send(renderContent(result.content,result.next_offset===null ? null : `${req.path}?version=${result.version}&offset=${result.next_offset}`));
 });
 app.post("/annotate", permit("annotate"), (req, res) => {
   const fields = z.object({ request_id: z.string(), flag: z.enum(FLAGS), note: z.string().max(10000).optional(),
