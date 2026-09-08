@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { GitHubSync } from "./github.js";
 import { recordSchemas } from "./collaboration.js";
 import { FLAGS, Room } from "./db.js";
 import { requirePermission, type Principal, type Permission } from "./auth.js";
@@ -12,7 +13,7 @@ const request_id = z.string().min(1).max(128).regex(/^[a-zA-Z0-9_.:-]+$/)
   .describe("Unique ID for this intended write. Reuse the same ID and payload when retrying; never reuse for different work.");
 const agent = z.string().max(64).optional().describe("Optional compatibility label; recorded author is always your authenticated identity.");
 
-export function buildMcpServer(room: Room, principal: Principal = { id: "admin", role: "admin" }, recordTool: (success: boolean) => void = () => {}): McpServer {
+export function buildMcpServer(room: Room, principal: Principal = { id: "admin", role: "admin" }, recordTool: (success: boolean) => void = () => {}, github?: GitHubSync): McpServer {
   const server = new McpServer({ name: "oneroom", version: "0.3.0" });
   function result(data: unknown) {
     const response = { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
@@ -114,5 +115,9 @@ export function buildMcpServer(room: Room, principal: Principal = { id: "admin",
     { request_id,interval_seconds:z.number().int().min(30).max(86400) },"post",a=>room.idempotent(principal.id,a.request_id,"check_in",{interval_seconds:a.interval_seconds},()=>c.checkin(principal.id,a.interval_seconds)));
   register("list_checkins", "Agent check-in deadlines, missed deadlines and runner failures. Cursor is after_id.",
     { after_id:cursor,limit },"read",a=>c.checkins(a.after_id,a.limit));
+  register("pr_test_evidence","Agent-reported tests only for the PR's current synced head commit, alongside provider CI/review. No tests means no evidence. Cursor is after_id.",
+    {key:name,after_id:cursor,limit},"read",a=>c.prTests(a.key,a.after_id,a.limit));
+  register("integration_status","GitHub sync configuration, last attempt/success and errors. No credentials are returned.",{},"read",()=>github?.status() ?? {configured_repos:[],error:"GitHub sync not configured"});
+  register("sync_pull_requests","Admin: refresh configured repositories from GitHub (read-only). Agent input cannot select an arbitrary host or repository.",{},"metrics",()=>github?.sync() ?? {configured_repos:[],error:"GitHub sync not configured"});
   return server;
 }

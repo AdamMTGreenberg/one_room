@@ -134,6 +134,10 @@ CREATE TRIGGER room_events_no_update BEFORE UPDATE ON room_events
 BEGIN SELECT RAISE(ABORT,'oneroom: events are append-only'); END;
 CREATE TRIGGER room_events_no_delete BEFORE DELETE ON room_events
 BEGIN SELECT RAISE(ABORT,'oneroom: events are append-only'); END;
+`, `
+CREATE TABLE source_checks (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, checked_at TEXT NOT NULL
+);
 `];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

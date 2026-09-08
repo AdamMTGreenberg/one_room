@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { GitHubSync, githubConfig } from "./github.js";
+import { mountDelivery } from "./delivery.js";
 import { renderBoards } from "./boards-ui.js";
 import type { RecordKind } from "./collaboration.js";
 import { randomBytes } from "node:crypto";
@@ -17,6 +19,10 @@ const cfg = loadConfig();
 const auth = new Auth(cfg);
 const room = new Room(cfg);
 room.collaboration.setMembers(auth.principals());
+const githubCfg=githubConfig();
+const github=new GitHubSync(room,githubCfg);
+const githubTimer=githubCfg.repos.length ? setInterval(()=>{void github.sync();},githubCfg.intervalSeconds*1000) : undefined;
+if(githubTimer){githubTimer.unref();void github.sync();}
 const ops = new Operations();
 const ingress = new RateLimiter((cfg.ratePerMinute ?? 120) * 10);
 const requests = new RateLimiter(cfg.ratePerMinute ?? 120);
@@ -89,13 +95,14 @@ app.use((req, res, next) => {
   }
   next();
 });
+const closeDelivery=mountDelivery(app,room);
 app.post("/logout", (req, res) => {
   auth.logout(cookie(req, cookieName));
   res.clearCookie(cookieName, cookieOptions);
   res.redirect(303, "/login");
 });
 app.post("/mcp", async (req, res) => {
-  const server = buildMcpServer(room, res.locals.principal, ops.recordTool);
+  const server = buildMcpServer(room, res.locals.principal, ops.recordTool, github);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { void server.close().catch(() => {}); });
   try { await server.connect(transport); await transport.handleRequest(req, res, req.body); }
@@ -118,6 +125,11 @@ app.get("/", (req, res) => {
   if (Buffer.byteLength(html) > room.reads.budget) throw new Error("UI response exceeds configured budget");
   res.type("html").send(html);
 });
+app.get("/pr-tests/:key",(req,res)=>{
+  const page=room.collaboration.prTests(req.params.key,Number(req.query.after_id??0));
+  res.type("html").send(renderContent(JSON.stringify(page,null,2),page.has_more?`${req.path}?after_id=${page.next_cursor}`:null));
+});
+app.get("/integrations",(_req,res)=>res.json(github.status()));
 app.get("/boards", (req,res) => {
   const html=renderBoards(room,res.locals.principal,res.locals.session?.csrf ?? "",z.record(z.string().max(1000)).parse(req.query));
   if(Buffer.byteLength(html)>room.reads.budget) throw new Error("oneroom: page exceeds response budget");
@@ -226,7 +238,7 @@ const monitor = setInterval(() => {
 monitor.unref();
 let stopping = false;
 function shutdown() {
-  if (stopping) return; stopping = true; clearInterval(monitor);
+  if (stopping) return; stopping = true; clearInterval(monitor); closeDelivery(); if(githubTimer)clearInterval(githubTimer);github.stop();
   const deadline = setTimeout(() => { httpServer.closeAllConnections(); process.exit(1); }, 10000);
   deadline.unref();
   httpServer.close(() => { clearTimeout(deadline); room.close(); process.exitCode = 0; });

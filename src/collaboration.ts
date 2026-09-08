@@ -15,7 +15,7 @@ export const recordSchemas = {
     areas: z.array(z.string().max(300)).max(100).default([]), depends_on: z.array(z.string().max(200)).max(30).default([]),
     blockers: short.default(""), lease_until: z.number().int().nonnegative().safe() }).strict(),
   pr: z.object({ repo, number: z.number().int().positive(), url: z.string().url().max(2000).refine(s => s.startsWith("https://")), title: short,
-    description: text, state: z.enum(["open", "closed", "merged"]), draft: z.boolean(), head_sha: sha,
+    description: z.string().refine(s=>Buffer.byteLength(s)<=256*1024,"PR description exceeds 256 KiB"), state: z.enum(["open", "closed", "merged"]), draft: z.boolean(), head_sha: sha,
     review: short, ci: short, synced_at: z.string().datetime(), source: z.literal("github") }).strict(),
   pr_note: z.object({ summary: short, detail: text.default("") }).strict(),
   test: z.object({ repo, commit: sha, suite: short.min(1), command: short, state: z.enum(["running", "passed", "failed", "canceled"]),
@@ -121,10 +121,17 @@ export class Collaboration {
     if (kind === "work") {
       if (parsed.lease_until > Date.now() + 24*3600000) fail("work lease cannot exceed 24 hours");
       if (parsed.depends_on.includes(key)) fail("work cannot depend on itself");
-      for (const dependency of parsed.depends_on) if (!this.latest("work",dependency)) fail(`missing work dependency ${dependency}`);
+      for (const dependency of parsed.depends_on) {
+        if (!this.latest("work",dependency)) fail(`missing work dependency ${dependency}`);
+        const cycle=this.db.prepare(`WITH RECURSIVE dependencies(key) AS (
+          SELECT ? UNION SELECT j.value FROM dependencies d JOIN room_records r ON r.kind='work' AND r.key=d.key
+          AND r.version=(SELECT MAX(n.version) FROM room_records n WHERE n.kind='work' AND n.key=r.key),json_each(r.data,'$.depends_on') j
+        ) SELECT 1 FROM dependencies WHERE key=? LIMIT 1`).get(dependency,key);
+        if(cycle)fail("work dependency would create a cycle");
+      }
     }
     const encoded = JSON.stringify(parsed);
-    if (Buffer.byteLength(encoded) > 56 * 1024) fail("record exceeds 56 KiB");
+    if (Buffer.byteLength(encoded) > (kind==="pr" ? 320 : 56) * 1024) fail("record exceeds byte limit");
     return this.write(Buffer.byteLength(encoded), () => {
       const previous = this.latest(kind,key);
       if ((previous?.version ?? 0) !== expectedVersion) fail("version conflict; read latest and retry with a new request_id");
@@ -137,6 +144,18 @@ export class Collaboration {
       return { id,kind,key,version };
     });
   }
+  syncPr(data: z.infer<typeof recordSchemas.pr>) {
+    const parsed=recordSchemas.pr.parse(data);const key=`${parsed.repo}#${parsed.number}`;
+    return this.write(0,()=>{
+      const old=this.latest("pr",key);
+      const {synced_at:_newTime,...newData}=parsed;
+      const {synced_at:_oldTime,...oldData}=old?.data ?? {};
+      const same=JSON.stringify(newData)===JSON.stringify(oldData);
+      const result=same ? {key,version:old!.version,changed:false} : {...this.put("github","pr",key,parsed,old?.version??0,true),changed:true};
+      this.db.prepare("INSERT INTO source_checks(key,checked_at) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET checked_at=excluded.checked_at").run(key,parsed.synced_at);
+      return result;
+    });
+  }
   records(kind: RecordKind, after = 0, limit = 20, historyKey?: string) {
     z.enum(Object.keys(recordSchemas) as [RecordKind,...RecordKind[]]).parse(kind); number(after); number(limit,1,100);
     if (historyKey !== undefined) z.string().max(200).parse(historyKey);
@@ -145,10 +164,21 @@ export class Collaboration {
       substr(COALESCE(json_extract(r.data,'$.summary'),json_extract(r.data,'$.title'),json_extract(r.data,'$.suite'),''),1,300) AS summary,
       json_extract(r.data,'$.state') AS state,json_extract(r.data,'$.repo') AS repo,json_extract(r.data,'$.branch') AS branch,
       json_extract(r.data,'$.commit') AS "commit",json_extract(r.data,'$.head_sha') AS head_sha,
-      json_extract(r.data,'$.synced_at') AS synced_at,json_extract(r.data,'$.lease_until') AS lease_until
+      COALESCE((SELECT checked_at FROM source_checks WHERE key=r.key AND r.kind='pr'),json_extract(r.data,'$.synced_at')) AS synced_at,json_extract(r.data,'$.lease_until') AS lease_until
       FROM room_records r WHERE r.kind=? AND r.id>? ${historyKey !== undefined ? "AND r.key=?" : "AND NOT EXISTS (SELECT 1 FROM room_records n WHERE n.kind=r.kind AND n.key=r.key AND n.id>r.id)"}
       ORDER BY r.id LIMIT ?`).all(...(historyKey !== undefined ? [kind,after,historyKey,limit+1] : [kind,after,limit+1])) as Row[];
     return this.page(rows.map(r => ({...r,...(r.lease_until !== null ? {lease_expired:r.lease_until <= Date.now()} : {})})),limit);
+  }
+  prTests(key:string,after=0,limit=20) {
+    number(after);number(limit,1,100);
+    const pr=this.latest("pr",key);if(!pr)fail("PR does not exist");
+    const checked=this.db.prepare("SELECT checked_at FROM source_checks WHERE key=?").get(key) as Row | undefined;
+    const rows=this.db.prepare(`SELECT r.id,r.key,r.agent,r.version,r.ts,json_extract(r.data,'$.state') AS state,
+      substr(json_extract(r.data,'$.suite'),1,300) AS suite,substr(json_extract(r.data,'$.summary'),1,300) AS summary
+      FROM room_records r WHERE r.kind='test' AND r.id>? AND json_extract(r.data,'$.repo')=? AND json_extract(r.data,'$.commit')=?
+      AND NOT EXISTS(SELECT 1 FROM room_records n WHERE n.kind=r.kind AND n.key=r.key AND n.id>r.id) ORDER BY r.id LIMIT ?`)
+      .all(after,pr.data.repo,pr.data.head_sha,limit+1) as Row[];
+    return {repo:pr.data.repo,head_sha:pr.data.head_sha,provider_ci:pr.data.ci,provider_review:pr.data.review,synced_at:checked?.checked_at ?? pr.data.synced_at,...this.page(rows,limit)};
   }
   content(kind: RecordKind, key: string, offset = 0, version?: number) {
     number(offset); const row = this.latest(kind,key,version); if (!row) return null;
@@ -157,6 +187,16 @@ export class Collaboration {
     let end = Math.min(bytes.length,offset+Math.floor(this.budget/16));
     while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
     return { kind,key,version:row.version,agent:row.agent,ts:row.ts,content:bytes.subarray(offset,end).toString(),next_offset:end < bytes.length ? end : null };
+  }
+  registerRunner(agent: string, seconds: number) {
+    number(seconds,30,86400);
+    return this.write(0,()=>{
+      const now=Date.now();
+      this.db.prepare(`INSERT INTO checkins(agent,interval_seconds,last_seen,next_due) VALUES (?,?,0,?)
+        ON CONFLICT(agent) DO UPDATE SET interval_seconds=excluded.interval_seconds,
+        next_due=MIN(checkins.next_due,?+excluded.interval_seconds*1000)`).run(agent,seconds,now,now);
+      return { agent,interval_seconds:seconds };
+    });
   }
   checkin(agent: string, seconds: number) {
     number(seconds,30,86400);

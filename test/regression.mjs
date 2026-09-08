@@ -175,7 +175,7 @@ test('SQLite online backup restores messages, annotations, versions and FTS', as
 
 test('version-zero migration preserves history and legacy pins; new flags target exact versions', t => {
   const { room, cfg } = fixture(t, {}, readFileSync(new URL('./fixtures/v0.1.sql', import.meta.url), 'utf8'));
-  assert.equal(room.operationalStatus().schema_version, 3);
+  assert.equal(room.operationalStatus().schema_version, 4);
   assert.equal(room.readMessages({})[0].content, 'legacy history');
   assert.equal(room.reads.pins().items[0].document_version, null);
   room.annotate({ agent: 'human', flag: 'resolved', documentName: 'plan', documentVersion: 0 });

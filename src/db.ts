@@ -458,7 +458,7 @@ export class Room {
   }
 
   *exportChunks(): Generator<string> {
-    const tables = ["messages", "annotations", "documents", "room_records", "room_events", "attention", "checkins", "thread_links"] as const;
+    const tables = ["messages", "annotations", "documents", "room_records", "room_events", "attention", "checkins", "thread_links", "source_checks"] as const;
     const maxima = tables.map((table) =>
       (this.db.prepare(`SELECT COALESCE(MAX(${table === "thread_links" ? "message_id" : "id"}), 0) AS id FROM ${table}`).get() as { id: number }).id);
     yield `{"exported_at":${JSON.stringify(new Date().toISOString())},"status":${JSON.stringify(this.status())}`;

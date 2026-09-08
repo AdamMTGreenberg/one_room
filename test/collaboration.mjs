@@ -77,3 +77,12 @@ test('log output redaction and durable event replay after restart',t=>{
  const reopened=new Room(cfg);try {assert.equal(reopened.collaboration.events().items.length,1);} finally {reopened.close();}
  const exported=JSON.parse([...room.exportChunks()].join(''));assert.equal(exported.room_records.length,1);
 });
+
+test('work dependency cycles are rejected, and runner restarts do not postpone overdue checks',t=>{
+ const {c}=setup(t);const work={title:'Task',state:'open',lease_until:0};
+ c.put('alice','work','a',work,0);c.put('alice','work','b',{...work,depends_on:['a']},0);
+ assert.throws(()=>c.put('alice','work','a',{...work,depends_on:['b']},1),/cycle/);
+ c.registerRunner('bob',30);const first=c.checkins().items[0];
+ c.registerRunner('bob',300);assert.equal(c.checkins().items[0].next_due,first.next_due);
+ assert.equal(c.claimWake('bob').reason,'check_in_due');
+});

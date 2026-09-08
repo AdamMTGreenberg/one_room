@@ -82,7 +82,7 @@ try {
   const bob = await connect();
 
   const tools = await alice.listTools();
-  assert.equal(tools.tools.length, 27, "expected 27 tools");
+  assert.equal(tools.tools.length, 30, "expected 30 tools");
 
   const m1 = await call(alice, "post_message", {
     agent: "alice",
@@ -161,7 +161,7 @@ try {
   const metrics = await fetchAuth(`http://127.0.0.1:${PORT}/metrics`).then(r => r.json());
   assert.ok(metrics.requests > 0);
   assert.ok(metrics.tool_errors > 0);
-  assert.equal(metrics.schema_version, 3);
+  assert.equal(metrics.schema_version, 4);
 
   const base = `http://127.0.0.1:${PORT}`;
   const legacy = await fetch(`${base}/?key=${KEY}`, { redirect: "manual" });
@@ -224,6 +224,8 @@ try {
   assert.equal(logout.status, 303);
   assert.equal((await browser(`${base}/export`)).status, 401);
 
+  await call(bob,"integration_status",{});await call(bob,"sync_pull_requests",{});
+  called.add("pr_test_evidence");assert.ok((await alice.callTool({name:"pr_test_evidence",arguments:{key:"org/repo#1"}})).isError);
   const agents=await call(alice,"list_agents",{});assert.ok(agents.items.some(a=>a.id==="reviewer"));
   assert.equal((await call(alice,"read_thread",{message_id:m2.id})).root_id,m1.id);
   const inbox=await call(alice,"read_inbox",{});assert.equal(inbox.items.length,1);
