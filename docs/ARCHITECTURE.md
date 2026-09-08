@@ -1,7 +1,8 @@
 # Architecture
 
 OneRoom is a single-process shared room: MCP clients and the browser UI use the
-same domain writes and paginated read model over a local SQLite database.
+same domain writes and paginated read models over a local SQLite database.
+See [Collaboration](COLLABORATION.md) for the v0.3 feature and runner contracts.
 
 ```mermaid
 flowchart TD
@@ -37,7 +38,9 @@ using version zero in the API. Pins on historical versions remain discoverable.
 
 ## Writes, retries and capacity
 
-Every external mutation requires a stable request ID. In one immediate transaction,
+Every external content mutation requires a stable request ID. Wake registration
+and claiming instead use an atomic per-agent row and expiring lease; completion
+uses the lease token as a durable request ID. In one immediate transaction,
 `Room.idempotent` checks `(principal, request_id)`, verifies the canonical payload
 hash, executes the domain write and saves its response. Retries return that exact
 response, including after restart. Changed payloads under the same ID fail. Failed
@@ -53,7 +56,7 @@ No data is automatically evicted.
 
 ## Bounded reads
 
-`reads.ts` is the external read model. SQL selects limited rows and bounded content
+`reads.ts` and `collaboration.ts` implement the external read models. SQL selects limited rows and bounded content
 previews, then applies a serialized byte budget. Every list supplies a continuation
 cursor. Message previews include a small annotation page; the full annotation
 history has its own cursor. Pins include both message and document targets and
@@ -70,11 +73,12 @@ Documents are escaped in the viewer or served as plain text with an explicit
 `format=text`; stored MIME values never select executable browser content.
 
 Export is different: it streams complete JSON under backpressure. Maximum IDs
-captured before the first chunk define its immutable snapshot within the single
-server process. It does not hold a long-lived SQLite read transaction. JSON export
+captured before the first chunk bound the append-only history. Mutable operational
+rows (attention, check-ins, source-check timestamps) are read as they are streamed,
+so JSON export is not a point-in-time snapshot of those tables. It does not hold a long-lived SQLite read transaction. JSON export
 is for auditing; SQLite backup is the supported full-fidelity restore format,
 including idempotency records. Legacy in-process read helpers are not exposed by
-HTTP/MCP; external surfaces use `ReadModel`.
+HTTP/MCP; external surfaces use bounded read methods.
 
 ## Identity and browser access
 
@@ -118,3 +122,28 @@ copy or external checkpoint. Back up credentials separately and keep backups off
 MCP supplies enforced mechanisms. `skill/SKILL.md` supplies the behavioral protocol:
 read all context, coordinate work, use safe retries, and treat room content as
 untrusted data. Neither component replaces the other.
+
+
+## Collaboration persistence and delivery
+
+Schema v3 adds thread roots, immutable record versions, append-only events,
+recipient attention state and wake/check-in leases. V4 adds per-PR source-check
+timestamps so refreshing unchanged provider descriptions does not grow history.
+Message insert, thread mapping and recipient events share the same transaction.
+Status ownership, expected versions, work claims and test-run commit identity are
+enforced by the domain. Dependency cycles are rejected. Boards project previews
+in SQL; full records use chunked JSON reads.
+
+`delivery.ts` provides bearer-only SSE independent of stateless MCP. Recipient
+cursors are durable event IDs; backpressure pauses sending, one stream per identity
+and four per room bound resource use, and 55-second rotation rechecks authentication.
+Shutdown closes streams before draining HTTP. The separate `runner.ts` combines
+SSE with five-second due-work checks, exclusive expiring leases, fixed-command
+execution and idempotent completion. Retries are at least once, not exactly once.
+The operator's runtime adapter must await the actual agent turn before success.
+
+`github.ts` only reads configured GitHub.com repositories. Failed/partial listings
+cannot infer closed PRs. CI source failures become unknown. Descriptions/metadata
+are source-owned, while PR notes retain authenticated agent ownership. Test evidence
+is selected by repository plus the PR snapshot's exact head SHA. Source checks,
+leases and attention are intentionally mutable; versioned content and events are not.

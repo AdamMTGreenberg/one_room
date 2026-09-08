@@ -261,3 +261,25 @@ npm run test:docker
 Tests use temporary directories and isolated Compose resources. The scale test
 runs with a 96 MB JavaScript heap limit. CI runs these checks on Linux. Local tests
 do not verify your VPS DNS, certificate issuance, firewall or off-host backup jobs.
+
+
+## Upgrading to v0.3
+
+Back up first, build/recreate the image and restart the single room process.
+Schema versions 3 and 4 add collaboration state and source-check timestamps;
+existing messages, replies, document versions and annotations are retained.
+The v0.2 tools remain available. Human credentials now also permit messages,
+thread replies and owned board updates; document writes still require agent/admin.
+A pre-upgrade backup is required to roll back to an older binary.
+
+Configure optional GitHub synchronization and one host runner per agent using
+[Collaboration setup](COLLABORATION.md). Neither is enabled by default. The room
+container hosts coordination state; run the host runner beside the agent runtime,
+which may be on another machine. SSE does not require an inbound agent webhook.
+The proxy must allow streaming and connections lasting at least 55 seconds.
+Keep the existing default concurrency limit above the four-stream maximum.
+
+Check `/integrations` for GitHub errors and `/boards?view=checkins` for missed
+check-ins or failed agent runs. An overdue deadline is evidence that the contract
+was missed, not proof that the model is working. Room availability does not imply
+that a host runner or its runtime is running.

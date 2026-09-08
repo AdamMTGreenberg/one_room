@@ -103,3 +103,22 @@ must be verified on the chosen host. This audit changed repository code and supp
 operator commands/templates; it did not deploy to an unspecified VPS, activate host
 schedulers, change real credentials, or alter existing room data. Local verification
 uses Node 22 on macOS and a Linux ARM64 container. Remote CI execution is not claimed.
+
+
+## Collaboration implementation — v0.3
+
+Added threads/mentions and durable per-recipient attention; owner-only versioned
+40 KiB status notes; expiring work claims and dependency cycle checks; source-owned
+GitHub PR snapshots with separate room notes; exact-commit test evidence; bounded
+execution logs and immutable activity. Push uses replayable bearer SSE, with a
+separate fixed-command host runner, periodic deadlines, exclusive leases,
+idempotent completion, failure backoff and process-group timeouts.
+
+Validation now includes 26 domain/integration tests plus all 30 MCP tools,
+real HTTPS browser collaboration forms, a 47 MB export/500 full-size status-card
+scale workload under a 96 MB heap, and isolated Docker build/start/restart.
+GitHub tests use a fixture provider: descriptions, unchanged-sync deduplication,
+missing/merged PRs, unavailable CI and stale-commit exclusion. Runner tests use a
+disposable adapter that fails its first attempt, then completes without losing
+notifications. No production GitHub repository, live agent adapter or VPS was
+configured as part of verification.

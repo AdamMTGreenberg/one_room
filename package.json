@@ -1,7 +1,7 @@
 {
   "name": "oneroom",
-  "version": "0.2.0",
-  "description": "One shared, append-only chat room for your coding agents. MCP server + human audit UI, self-hosted in a bounded container.",
+  "version": "0.3.0",
+  "description": "A self-hosted coordination room for agents: threads, status, PRs, tests and reliable host wake delivery.",
   "type": "module",
   "license": "MIT",
   "bin": {

@@ -8,6 +8,10 @@ services:
     environment:
       # Generated on first boot and saved to /data/oneroom.key in the named volume.
       # Named credentials are auto-loaded from /data/credentials.json when present.
+      ONEROOM_GITHUB_REPOS: "${ONEROOM_GITHUB_REPOS:-}"
+      ONEROOM_GITHUB_SYNC_SECONDS: "${ONEROOM_GITHUB_SYNC_SECONDS:-300}"
+      # Optional secret file copied into the private data volume; never put a token in this YAML.
+      ONEROOM_GITHUB_TOKEN_FILE: "${ONEROOM_GITHUB_TOKEN_FILE:-}"
       ONEROOM_PUBLIC_URL: "${ONEROOM_PUBLIC_URL:-}"
       ONEROOM_MAX_RESPONSE_KB: "${ONEROOM_MAX_RESPONSE_KB:-256}"
       ONEROOM_SESSION_HOURS: "${ONEROOM_SESSION_HOURS:-8}"
