@@ -1,20 +1,46 @@
 services:
   oneroom:
     build: .
-    container_name: oneroom
     ports:
-      - "7777:7777"
+      - "127.0.0.1:${ONEROOM_PORT:-7777}:7777"
     volumes:
-      - ./data:/data
+      - oneroom-data:/data
     environment:
-      # Generated on first boot and saved to ./data/oneroom.key if unset.
-      # ONEROOM_KEY: "or_change_me"
-      ONEROOM_MAX_DB_MB: "256"
-      ONEROOM_MAX_MESSAGE_KB: "64"
-      ONEROOM_MAX_DOC_KB: "512"
-      ONEROOM_RETENTION_DAYS: "0" # 0 = unlimited; N hides (never deletes) messages older than N days
+      # Generated on first boot and saved to /data/oneroom.key in the named volume.
+      # Named credentials are auto-loaded from /data/credentials.json when present.
+      ONEROOM_GITHUB_REPOS: "${ONEROOM_GITHUB_REPOS:-}"
+      ONEROOM_GITHUB_SYNC_SECONDS: "${ONEROOM_GITHUB_SYNC_SECONDS:-300}"
+      # Optional secret file copied into the private data volume; never put a token in this YAML.
+      ONEROOM_GITHUB_TOKEN_FILE: "${ONEROOM_GITHUB_TOKEN_FILE:-}"
+      ONEROOM_PUBLIC_URL: "${ONEROOM_PUBLIC_URL:-}"
+      ONEROOM_MAX_RESPONSE_KB: "${ONEROOM_MAX_RESPONSE_KB:-256}"
+      ONEROOM_SESSION_HOURS: "${ONEROOM_SESSION_HOURS:-8}"
+      ONEROOM_RATE_PER_MINUTE: "${ONEROOM_RATE_PER_MINUTE:-120}"
+      ONEROOM_MAX_CONCURRENT_REQUESTS: "${ONEROOM_MAX_CONCURRENT_REQUESTS:-16}"
+      ONEROOM_MIN_FREE_DISK_MB: "${ONEROOM_MIN_FREE_DISK_MB:-64}"
+      ONEROOM_MAX_DB_MB: "${ONEROOM_MAX_DB_MB:-256}"
+      ONEROOM_MAX_MESSAGE_KB: "${ONEROOM_MAX_MESSAGE_KB:-64}"
+      ONEROOM_MAX_DOC_KB: "${ONEROOM_MAX_DOC_KB:-512}"
+      ONEROOM_RETENTION_DAYS: "${ONEROOM_RETENTION_DAYS:-0}" # 0 = unlimited; N hides (never deletes) messages older than N days
     # The container itself is bounded, per the design: memory, CPU, pids.
     mem_limit: 256m
     cpus: 0.5
     pids_limit: 64
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 15s
     restart: unless-stopped
+
+volumes:
+  oneroom-data:

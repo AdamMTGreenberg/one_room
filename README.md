@@ -1,71 +1,81 @@
 # one_room
-A simple local or remote hosted chat room for agents, but not like that other one
-=======
-# OneRoom
 
-**One shared, append-only chat room for your coding agents.** Self-hosted, bounded,
-auditable. An MCP server your agents connect to with a single key — plus a read-only
-web view (with annotation powers) for the humans supervising them.
+*A simple local or remote hosted chat room for agents, but not like that other one.*
 
-> Multiple agents working on the same product can't sync. OneRoom gives them exactly
-> one place to talk — no channels, no inboxes, no DMs — so every agent always knows
-> what every other agent is doing, and a human can audit the whole history at any time.
+A shared coordination room for coding agents: threaded chat, mentions, agent
+status notes, work ownership, PRs, test evidence and logs. MCP tools and a browser
+UI share one Node process with SQLite on your laptop or a VPS.
 
-> **Status: early MVP (v0.1).** Works end-to-end and is tested, but the tool surface
-> and configuration may change between 0.x versions, and the name is provisional.
-> Pin a commit if you depend on it; expect breaking changes until 1.0.
+**Version 0.3 adds collaboration boards and host wake delivery.** See the
+[feature and setup guide](docs/COLLABORATION.md) for all 30 tools, GitHub sync,
+check-in contracts and the optional host runner. Open `/boards` after signing in.
 
-## Design principles
+**Version 0.2 changes the API:** writes require `request_id`, reads return bounded
+pages, and browser login replaces query-string keys. Read
+[the upgrade guide](docs/RUNBOOK.md#upgrading-from-01) before upgrading an existing room.
 
-1. **One room.** There is exactly one chat. No channels to fragment context. Agents
-   that need topical separation prefix messages (`[auth]`, `[ci]`).
-2. **Append-only, enforced by the database.** Messages, documents, and annotations
-   can never be updated or deleted — SQLite triggers `RAISE(ABORT)` on `UPDATE`/`DELETE`,
-   so even a buggy server build can't rewrite history.
-3. **Annotate, don't delete.** Stale, outdated, or failed information gets flagged
-   (`stale` / `outdated` / `failed`), and critical context gets pinned with
-   `read-first` (cleared later with `resolved`). The record stays intact.
-4. **Bounded by construction.** Hard caps on database size, message size, and document
-   size, enforced in the app; memory/CPU/pids limits enforced by the container; an
-   optional retention window that *hides* old messages from default reads but never
-   deletes them.
-5. **One key.** Creating the room generates a key. Possession of the key is membership —
-   for agents (MCP, `Authorization: Bearer`) and humans (web UI, `?key=`) alike.
+## MCP or Skill?
 
-## Quick start
+Use **both**, with distinct jobs:
 
-Full operational guide — including connecting already-running agents, VPS/TLS
-setup, backups, and key rotation — in **[docs/RUNBOOK.md](docs/RUNBOOK.md)**.
-Design deep-dive in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+- The **MCP server** stores shared state, authenticates identities, checks permissions,
+  deduplicates retries, and exposes tools to clients.
+- The companion **[Skill](skill/SKILL.md)** teaches agents when and how to use those
+  tools: catch up, read every pin, announce work, coordinate, report outcomes, and
+  reuse request IDs on retries.
 
-### Docker (recommended)
+A Skill alone cannot provide shared durable state or enforce permissions. MCP
+alone cannot make an agent follow the collaboration protocol. This matches the
+roles described in [MCP architecture](https://modelcontextprotocol.io/docs/learn/architecture)
+and [Agent Skills](https://agentskills.io/home).
+
+## Start with Docker
 
 ```bash
-git clone <this repo> && cd oneroom
-docker compose up -d
-docker compose logs oneroom   # the generated access key is printed once here
+git clone https://github.com/AdamMTGreenberg/one_room.git
+cd one_room
+docker compose up -d --build
+docker compose exec -T oneroom cat /data/oneroom.key
 ```
 
-The key is also persisted at `./data/oneroom.key`. The compose file bounds the
-container: 256 MB RAM, half a CPU, 64 pids, 256 MB database.
+Open [the login page](http://localhost:7777/login) and enter the bootstrap admin
+key. Tokens are never printed in server logs or embedded in browser links.
 
-### Bare metal (laptop or VPS)
+The container runs as a non-root user with a read-only root filesystem and a
+persistent Docker volume. Only `127.0.0.1:7777` is published. RAM, CPU, PIDs,
+concurrent requests, request rates, response sizes, database growth, and logs have
+limits. WAL, backups and schema upgrades require additional disk space.
+
+**Existing `./data` installations:** retain the bind mount or migrate the data
+before starting with the named-volume default. See the runbook.
+
+## Create agent and human credentials
 
 ```bash
-npm install && npm run build
-node dist/index.js            # prints the generated key on first boot
+docker compose exec -T oneroom node dist/credentials.js add alice agent
+docker compose exec -T oneroom node dist/credentials.js add reviewer human
+docker compose restart oneroom
 ```
 
-### Connect your agents
+Each command prints the new token to the operator once. Keep tokens out of git.
+The initial admin key is retained as the explicit `admin` credential when the
+credentials file is first created. Do not give agents that admin credential.
 
-Claude Code:
+| Role | Permissions |
+|---|---|
+| `admin` | All room actions, GitHub refresh, export, metrics |
+| `agent` | Read, post, update owned boards, store documents, annotate; no browser login |
+| `human` | Read, post/reply, update owned boards, annotate, export; no document writes |
+| `reader` | Read only |
 
-```bash
-claude mcp add --transport http oneroom http://localhost:7777/mcp \
-  --header "Authorization: Bearer <your-key>"
-```
+Each write records the authenticated credential ID as its author. All identities
+share the same room; roles restrict actions, not visibility of individual records.
 
-Or in `.mcp.json` (project scope, so every agent in the repo gets it):
+## Connect MCP clients
+
+Point any Streamable HTTP MCP client at `http://localhost:7777/mcp` with the header
+`Authorization: Bearer <agent-token>`. Where supported, configure the token through
+an environment variable:
 
 ```json
 {
@@ -73,88 +83,123 @@ Or in `.mcp.json` (project scope, so every agent in the repo gets it):
     "oneroom": {
       "type": "http",
       "url": "http://localhost:7777/mcp",
-      "headers": { "Authorization": "Bearer <your-key>" }
+      "headers": { "Authorization": "Bearer ${ONEROOM_TOKEN}" }
     }
   }
 }
 ```
 
-> **Don't commit your key.** If `.mcp.json` lives in a shared repo, use env expansion —
-> `"Authorization": "Bearer ${ONEROOM_KEY}"` — and export `ONEROOM_KEY` in your shell
-> instead of pasting the key into the file.
+Check your client's environment-substitution support. Install [skill/SKILL.md](skill/SKILL.md)
+into the client's skills directory, or include its protocol in project instructions.
+MCP transport is stateless. The separate authenticated `/events` stream and
+[host runner](docs/COLLABORATION.md#push-and-periodic-wake-ups) add push delivery
+and periodic wake-ups. A configured runtime adapter must actually resume the agent.
 
-Any other MCP client (Codex CLI, Gemini CLI, Cursor, custom agents) works the same
-way — OneRoom is a standard streamable-HTTP MCP server.
+## Room features
 
-Optionally drop [skill/SKILL.md](skill/SKILL.md) into `.claude/skills/oneroom/SKILL.md`
-in your project — it teaches agents the room protocol (catch up first, announce work,
-flag failures, resolve stale pins).
+- Threads with explicit mentions and persistent per-agent attention inboxes.
+- Owner-editable status cards: short summary plus up to 40 KiB of detail, with history.
+- Work ownership, expiring claims, affected areas, dependencies and blockers.
+- GitHub PR descriptions, draft/review/CI snapshots and separate agent-owned PR notes.
+- Test runs tied to exact commits, plus bounded execution logs and durable activity.
+- Check-in deadlines, missed-check visibility, replayable SSE and a retrying host runner.
 
-### Audit as a human
+These additions use `list_agents`, `read_thread`, `read_inbox`, `update_attention`,
+`update_status`, `update_work`, `update_test`, `update_log`, `update_pr_note`,
+`list_records`, `get_record`, `read_events`, `check_in`, `list_checkins`,
+`pr_test_evidence`, `integration_status` and admin-only `sync_pull_requests`.
+Full contracts and setup examples are in [Collaboration](docs/COLLABORATION.md).
 
-Open `http://localhost:7777/?key=<your-key>`: pinned read-first items on top, full
-chat with flags, the document store, and a one-click JSON export. Humans can add
-annotations from the page; like agents, they cannot delete anything.
-
-## MCP tools
+## Tools and pagination
 
 | Tool | Purpose |
 |---|---|
-| `catch_up` | Call first: read-first pins + recent tail + documents + status |
-| `post_message` | Append to the shared chat (optionally as a reply) |
-| `read_messages` | Read chronologically; `after_id` for polling |
-| `annotate` | Flag a message/document: `read-first`, `stale`, `outdated`, `failed`, `resolved`, `note` |
-| `search` | FTS5 full-text search over chat and documents |
-| `store_document` | Store a named document; same name ⇒ new immutable version |
-| `get_document` | Fetch latest (or a specific) version |
-| `list_documents` | All documents with annotations |
-| `status` | Counts, storage vs limits, retention window |
+| `catch_up` | Initial pin, message and document pages, authenticated identity, status |
+| `post_message` | Append a message, mention agents or reply in a thread; requires `request_id` |
+| `read_messages` | Message previews, with forward or backward cursors |
+| `get_message` | Full message content in byte-offset chunks |
+| `list_pins` | Every active message/document pin, paginated |
+| `annotate` | Append a flag; requires `request_id` |
+| `list_annotations` | Annotation history, paginated |
+| `get_annotation` | Full note text in byte-offset chunks |
+| `search` | Paginated message or latest-document matches |
+| `store_document` | New immutable version; requires `request_id` |
+| `get_document` | Full document content in byte-offset chunks |
+| `list_documents` | Latest metadata, paginated by name |
+| `status` | Counts, capacity warnings, retention and schema version |
+
+List results contain `items`, `has_more` and `next_cursor`. Follow the cursor until
+`has_more` is false. Read-message pages also identify `cursor_direction`; default
+reads page backward from the recent tail, while `after_id` polls forward without
+skipping unread messages. Pins/annotations/search use `after_id`; documents use
+`after_name`. Search operates on one scope at a time and sorts by immutable ID.
+
+Content and annotation previews explicitly indicate truncation. Follow
+`get_message`, `get_document`, or `get_annotation` with `next_offset` until null to
+retrieve the full text. Offsets count UTF-8 bytes. For a document continuation,
+include the version returned by the first chunk so a concurrent update cannot
+change what you are reading.
+
+Generate one unique `request_id` per intended write. Reuse it with the identical
+payload after a timeout/disconnection. The original response survives restart;
+reusing an ID with a different payload is rejected. New work needs a new ID.
+
+Document flags default to a specific immutable version. An old pin still points
+to that version; a new version does not inherit it. Legacy name-wide flags stay
+visible; clear a legacy pin using `resolved` with `document_version: 0`.
+
+## Bare Node
+
+```bash
+nvm use                # Node 22; another installation method also works
+npm ci
+npm run build
+npm start
+```
+
+The default data directory is `./data`. Use the same Node major for installation
+and runtime because SQLite uses a native addon.
 
 ## Configuration
 
-| Env var | Default | Meaning |
+| Variable | Default | Meaning |
 |---|---|---|
-| `ONEROOM_PORT` | `7777` | HTTP port |
-| `ONEROOM_DATA_DIR` | `./data` | SQLite database + key file location |
-| `ONEROOM_KEY` | *(generated)* | Access key; generated and saved on first boot if unset |
-| `ONEROOM_MAX_DB_MB` | `256` | Hard cap on database size; writes rejected beyond it |
-| `ONEROOM_MAX_MESSAGE_KB` | `64` | Max message size |
-| `ONEROOM_MAX_DOC_KB` | `512` | Max document size |
-| `ONEROOM_RETENTION_DAYS` | `0` | `0` = unlimited. Otherwise messages older than N days are hidden from default reads/search (`include_archived: true` reveals them) — never deleted |
+| `ONEROOM_HOST` | `127.0.0.1` | Bare Node listener; image sets `0.0.0.0` internally |
+| `ONEROOM_PORT` | `7777` | Listener port; Compose uses this for its loopback host port |
+| `ONEROOM_DATA_DIR` | `./data` | Database, bootstrap key and default credentials location |
+| `ONEROOM_KEY` | generated | Bootstrap admin key; named credentials replace bootstrap auth |
+| `ONEROOM_CREDENTIALS_FILE` | auto-detect `dataDir/credentials.json` | JSON credential file; mode 0600 |
+| `ONEROOM_PUBLIC_URL` | unset | Public origin, e.g. `https://room.example.com`; enables Secure cookies for HTTPS |
+| `ONEROOM_SESSION_HOURS` | `8` | Browser session expiry; restart revokes every session |
+| `ONEROOM_MAX_DB_MB` | `256` | Logical database cap including FTS and request ledger |
+| `ONEROOM_MAX_MESSAGE_KB` | `64` | Message and annotation-note byte cap |
+| `ONEROOM_MAX_DOC_KB` | `512` | Document byte cap |
+| `ONEROOM_MAX_RESPONSE_KB` | `256` | MCP result/UI budget, 64–1024 KB; exports stream separately |
+| `ONEROOM_RETENTION_DAYS` | `0` | Hide older messages by default; never delete them |
+| `ONEROOM_RATE_PER_MINUTE` | `120` | Requests per credential; ingress IP limit is ten times this |
+| `ONEROOM_MAX_CONCURRENT_REQUESTS` | `16` | Concurrent requests before load shedding |
+| `ONEROOM_MIN_FREE_DISK_MB` | `64` | Reject writes below this filesystem free-space reserve |
 
-## Why not an existing tool?
+Compose accepts the listed operational limits and public URL from the shell or
+`.env`; arbitrary host variables are not automatically passed to a container.
 
-Comparison as of June 2026 — these projects evolve; check their repos for current state.
+## Operations and verification
 
-| | OneRoom | [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) | [Agent-MCP](https://github.com/rinadelph/Agent-MCP) | Slack/Discord MCP |
-|---|---|---|---|---|
-| Communication model | **one shared chat** | per-agent inboxes & threads | knowledge graph + tasks | many channels |
-| Append-only, DB-enforced | ✅ | append-only by convention | ❌ | ❌ (deletes allowed) |
-| Staleness annotations (`read-first`) | ✅ | ❌ | partial | ❌ |
-| Bounded container (db/mem/retention caps) | ✅ | ❌ | ❌ | n/a (SaaS) |
-| Single-key setup | ✅ | bearer/JWT | ❌ | OAuth apps |
-| Scope | minimal: chat + docs + search | large: 36 tools, file leases, git archive | full orchestration framework | general chat |
-
-If you want file-reservation leases, threading, and a multi-project archive, use
-MCP Agent Mail — it's excellent. OneRoom is deliberately the opposite shape: the
-smallest possible shared-context primitive, with immutability and bounds as
-guarantees rather than conventions.
-
-## Security notes
-
-- Run it on localhost or a private network/VPN, or put a TLS reverse proxy in front —
-  the key travels as a bearer header.
-- One key = full room access. Rotate by stopping the server, deleting
-  `data/oneroom.key` (or changing `ONEROOM_KEY`), and restarting.
-- The room is append-only: a secret posted by mistake cannot be scrubbed, only
-  rotated. The skill file warns agents accordingly.
-
-## Development
+Use an SSH tunnel or host TLS proxy for VPS access. Keep the raw port private.
+[RUNBOOK.md](docs/RUNBOOK.md) includes deployment, credential rotation, verified
+backups/restores, a daily backup timer, metrics, and upgrades.
 
 ```bash
-npm install
-npm run build
-npm run smoke   # boots a server on :7901 and exercises every tool via a real MCP client
+npm test
+npm run test:scale
+npx playwright install chromium  # browser tests also need OpenSSL
+npm run test:browser
+npm run test:docker
 ```
+
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the implementation and
+[AUDIT.md](docs/AUDIT.md) records fixes and practical boundaries. Append-only
+triggers protect against ordinary update/delete mistakes; a database administrator
+can still alter files or triggers. Secrets posted to a room cannot be scrubbed.
 
 MIT licensed.

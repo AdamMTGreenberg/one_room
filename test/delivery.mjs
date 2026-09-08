@@ -1,0 +1,132 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import express from "express";
+import { once } from "node:events";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { Room } from "../dist/db.js";
+import { mountDelivery } from "../dist/delivery.js";
+import { runHost } from "../dist/runner.js";
+
+test("SSE replays recipient events and host runner retries failed commands without losing notifications", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "room-delivery-"));
+  const room = new Room({
+    dataDir: dir,
+    dbPath: path.join(dir, "room.db"),
+    maxDbBytes: 8 * 1024 * 1024,
+    maxMessageBytes: 65536,
+    maxDocBytes: 524288,
+    retentionDays: 0,
+  });
+  room.collaboration.setMembers([
+    { id: "alice", role: "agent" },
+    { id: "bob", role: "agent" },
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, res, next) => {
+    if (req.headers.authorization !== "Bearer test") {
+      res.status(401).end();
+      return;
+    }
+    res.locals.principal = { id: "bob", role: "agent" };
+    next();
+  });
+  const closeStreams = mountDelivery(app, room);
+  const server = app.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const stop = new AbortController();
+  let host;
+  t.after(async () => {
+    stop.abort();
+    if (host) await host;
+    closeStreams();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    room.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  assert.equal((await fetch(url + "/events")).status, 401);
+  const a = room.postMessage("alice", "Question", undefined, ["bob"], true);
+  const event = room.collaboration.events(0, 20, "bob").items[0];
+  const sse = await fetch(url + "/events", {
+    headers: { Authorization: "Bearer test" },
+  });
+  assert.equal(sse.status, 200);
+  const reader = sse.body.getReader();
+  let frame = "";
+  while (!frame.includes("event: attention"))
+    frame += new TextDecoder().decode((await reader.read()).value);
+  assert.match(frame, new RegExp(`id: ${event.id}`));
+  assert.equal(
+    (
+      await fetch(url + "/events", {
+        headers: { Authorization: "Bearer test" },
+      })
+    ).status,
+    429,
+  );
+  await reader.cancel();
+  await new Promise((r) => setTimeout(r, 50));
+  const second = room.postMessage("alice", "Another", undefined, ["bob"]);
+  const replay = await fetch(url + "/events", {
+    headers: {
+      Authorization: "Bearer test",
+      "Last-Event-ID": String(event.id),
+    },
+  });
+  const r2 = replay.body.getReader();
+  let text = "";
+  while (!text.includes("event: attention"))
+    text += new TextDecoder().decode((await r2.read()).value);
+  assert.ok(!text.includes(`"target":"${a.id}"`));
+  assert.ok(text.includes(`"target":"${second.id}"`));
+  await r2.cancel();
+  writeFileSync(path.join(dir, "token"), "test", { mode: 0o600 });
+  writeFileSync(
+    path.join(dir, "adapter.mjs"),
+    `import fs from 'node:fs';let input='';for await(const c of process.stdin)input+=c;const n=fs.existsSync('attempts')?Number(fs.readFileSync('attempts')):0;fs.writeFileSync('attempts',String(n+1));fs.writeFileSync('wake.json',input);process.exit(n===0?1:0);`,
+  );
+  host = runHost(
+    {
+      url,
+      token_file: path.join(dir, "token"),
+      cwd: dir,
+      command: [process.execPath, path.join(dir, "adapter.mjs")],
+      interval_seconds: 30,
+      timeout_seconds: 5,
+    },
+    stop.signal,
+    () => {},
+  );
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (
+      existsSync(path.join(dir, "attempts")) &&
+      Number(readFileSync(path.join(dir, "attempts"))) > 1 &&
+      room.collaboration.checkins().items[0].failures === 0
+    )
+      break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(Number(readFileSync(path.join(dir, "attempts"))), 2);
+  const payload = JSON.parse(readFileSync(path.join(dir, "wake.json")));
+  assert.equal(payload.type, "oneroom_wake");
+  assert.equal(payload.reason, "notification");
+  assert.equal(room.collaboration.claimWake("bob"), null);
+  assert.equal(
+    room.collaboration.inbox("bob").items.length,
+    2,
+    "waking does not resolve questions",
+  );
+  stop.abort();
+  await host;
+});

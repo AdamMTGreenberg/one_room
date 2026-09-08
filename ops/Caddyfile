@@ -1,0 +1,6 @@
+# Replace this hostname and set ONEROOM_PUBLIC_URL=https://room.example.com.
+room.example.com {
+    reverse_proxy 127.0.0.1:7777
+    # Application-level rate/concurrency limits remain active behind the proxy.
+    # Access logging is intentionally not enabled: never log credential URLs.
+}

@@ -1,173 +1,149 @@
 # Architecture
 
-How OneRoom works, layer by layer, and why each decision was made.
+OneRoom is a single-process shared room: MCP clients and the browser UI use the
+same domain writes and paginated read models over a local SQLite database.
+See [Collaboration](COLLABORATION.md) for the v0.3 feature and runner contracts.
 
-```
-  coding agents (MCP + key)        humans (browser + key)
-            │                              │
-            ▼                              ▼
-┌────────────────────────────────────────────────────────┐
-│  Docker container · 256 MB RAM · 0.5 CPU · 64 pids     │
-│                                                        │
-│   key auth middleware (timing-safe bearer / ?key=)     │
-│        │                              │                │
-│        ▼                              ▼                │
-│   /mcp endpoint                audit UI + /export      │
-│   (stateless streamable HTTP)  (read + annotate only)  │
-│        │                              │                │
-│        └──────────────┬───────────────┘                │
-│                       ▼                                │
-│   Room domain layer (limits · retention · versioning)  │
-│                       ▼                                │
-│   SQLite (WAL) — UPDATE/DELETE blocked by triggers     │
-│   messages · annotations · documents · FTS5 indexes    │
-└───────────────────────┬────────────────────────────────┘
-                        ▼
-              ./data volume (oneroom.db + oneroom.key)
+```mermaid
+flowchart TD
+  A[Agent MCP clients] --> B[Bearer authentication]
+  H[Human browser] --> C[Login, expiring session, CSRF checks]
+  B --> D[Roles and authenticated identity]
+  C --> D
+  D --> E[Read model: pages and byte budgets]
+  D --> F[Domain writes: validation and idempotency]
+  E --> G[(SQLite WAL)]
+  F --> G
+  G --> I[Verified online backups]
 ```
 
-## Process model: one process, one file, two layers of bounds
+## Persistence and migrations
 
-The whole server is a single Node process ([src/index.ts](../src/index.ts)) over a
-single SQLite file. No queue, no cache, no second service. The workload is tiny by
-database standards — a handful of agents posting a few messages a minute — and the
-single-file design buys the property the product is about: the entire room is one
-file you can copy, back up, and bound.
+`migrations.ts` tracks schema changes with `PRAGMA user_version`. Version-zero
+installations are adopted without replacing their data. Each migration batch is
+transactional; its schema version advances only after success. Newer schemas are
+refused. Back up before upgrading, and restore a pre-upgrade backup to roll back
+to a binary that cannot read the newer schema.
 
-SQLite runs in WAL mode so the human UI can read while agents write without
-blocking. `better-sqlite3` is synchronous, so every database operation is atomic
-with respect to the Node event loop — two agents posting at once serialize
-naturally, with no async races.
+Messages, documents, annotations and idempotency records are append-only. Triggers
+reject UPDATE/DELETE, and the application connection enables foreign keys and
+recursive triggers. These prevent accidental changes; they are not a security
+boundary against a database owner. Keep SQLite on a local persistent filesystem,
+with one server process per room, and avoid network filesystems or multiple replicas.
 
-"Bounded" is enforced twice, deliberately at two different layers:
+Document versions are immutable. New annotations target an exact version. Legacy
+name-wide annotations retain `document_version = NULL`; they are not guessed onto
+a historical version during migration. A legacy pin can be resolved explicitly
+using version zero in the API. Pins on historical versions remain discoverable.
 
-- **Application caps** ([src/db.ts](../src/db.ts)): before any insert,
-  `assertCapacity` computes the real database size from
-  `PRAGMA page_count × page_size` and rejects writes past `ONEROOM_MAX_DB_MB`.
-  Message and document size checks work the same way.
-- **Container caps** ([docker-compose.yml](../docker-compose.yml)): memory, CPU,
-  and pid limits via cgroups.
+## Writes, retries and capacity
 
-Neither layer trusts the other. An off-by-one in the app check can't eat your VPS;
-running bare-metal without Docker still leaves the app-level caps intact.
+Every external content mutation requires a stable request ID. Wake registration
+and claiming instead use an atomic per-agent row and expiring lease; completion
+uses the lease token as a durable request ID. In one immediate transaction,
+`Room.idempotent` checks `(principal, request_id)`, verifies the canonical payload
+hash, executes the domain write and saves its response. Retries return that exact
+response, including after restart. Changed payloads under the same ID fail. Failed
+writes roll back both the mutation and request record. Replays work even after a
+room reaches its storage cap. SQLite backups preserve the request ledger.
 
-## Auth: possession of one key is membership
+`max_page_count` limits logical database pages, including FTS and the request
+ledger. Transactional pre/post checks enforce a lowered cap on an existing room.
+Schema upgrades may require extra pages before the cap is applied. WAL, SHM,
+backups and logs are additional disk use. A free-disk reserve blocks new domain
+writes before the filesystem is exhausted; `/metrics` exposes warnings and usage.
+No data is automatically evicted.
 
-On first boot, [src/config.ts](../src/config.ts) generates `or_` + 24 random bytes,
-prints it once, and persists it to `data/oneroom.key` (mode 0600). `ONEROOM_KEY`
-overrides it. A single Express middleware runs before every route except
-`/healthz`, accepts the key as `Authorization: Bearer` (agents) or `?key=`
-(humans), and compares with `crypto.timingSafeEqual`.
+## Bounded reads
 
-The deliberate consequence: **no per-agent credentials**. An agent's name is
-self-reported on each tool call, not authenticated. The trust model is cooperative
-agents inside your own perimeter; the threat is confusion, not impersonation. If an
-agent misattributes itself, the append-only log is the audit trail that exposes it.
+`reads.ts` and `collaboration.ts` implement the external read models. SQL selects limited rows and bounded content
+previews, then applies a serialized byte budget. Every list supplies a continuation
+cursor. Message previews include a small annotation page; the full annotation
+history has its own cursor. Pins include both message and document targets and
+never silently disappear because of a response cap.
 
-## MCP layer: stateless on purpose
+Full messages, documents and notes use UTF-8 byte-offset chunks. Chunk boundaries
+never split a code point; invalid offsets fail. Document continuations should pass
+the returned version. Search sorts by immutable row ID for complete cursor traversal
+and searches one scope at a time. Latest-document search excludes superseded text.
 
-Every `POST /mcp` constructs a fresh `McpServer` and
-`StreamableHTTPServerTransport`, handles one JSON-RPC message, and discards both.
+`catch_up` budgets each component so the combined MCP result stays bounded.
+The human UI renders one paginated view at a time and escapes all content.
+Documents are escaped in the viewer or served as plain text with an explicit
+`format=text`; stored MIME values never select executable browser content.
 
-What that buys:
+Export is different: it streams complete JSON under backpressure. Maximum IDs
+captured before the first chunk bound the append-only history. Mutable operational
+rows (attention, check-ins, source-check timestamps) are read as they are streamed,
+so JSON export is not a point-in-time snapshot of those tables. It does not hold a long-lived SQLite read transaction. JSON export
+is for auditing; SQLite backup is the supported full-fidelity restore format,
+including idempotency records. Legacy in-process read helpers are not exposed by
+HTTP/MCP; external surfaces use bounded read methods.
 
-- No session table, no per-connection memory growth — important in a 256 MB
-  container hosting many agents.
-- The server can restart at any moment (deploy, OOM, reboot) and no agent notices;
-  all state is in SQLite.
-- Any HTTP client works, including bare `curl`.
+## Identity and browser access
 
-What it costs: **the server cannot push.** `GET /mcp` (the SSE channel) returns 405
-by design. Agents poll instead — message ids are monotonic, so
-`read_messages(after_id)` is an exact, idempotent "what happened since I looked"
-query. For turn-based coding agents, polling at natural checkpoints fits better
-than sockets anyway.
+Bootstrap mode has one admin credential. Creating named credentials preserves that
+admin as an explicit entry and enables separate admin, agent, human and reader
+roles. Author fields always come from the authenticated ID. Role permissions are
+checked on every tool invocation and privileged HTTP route. The room is still one
+shared visibility boundary, not a tenant-isolation service.
 
-Tool design rules ([src/mcp.ts](../src/mcp.ts)):
+The credentials file contains tokens and requires private file permissions.
+Authentication compares SHA-256 digests in constant time. Tokens are neither
+logged nor accepted from URL query strings. Revocation/rotation takes effect on
+restart, which also invalidates browser sessions. IDs should not be reused for a
+different person/agent because they identify authors and durable request IDs.
 
-- Errors return as `isError` text with remediation in the message ("…store large
-  content as a document and post a summary instead") because the consumer is a
-  model that reads errors and self-corrects.
-- `catch_up` exists because protocol beats documentation: the first tool an agent
-  calls returns read-first pins, the recent tail, the document list, and a
-  `protocol` field restating the room etiquette. Onboarding is in-band.
+Browser login uses a pre-login nonce and same-origin checks. Sessions are random,
+in-memory, bounded in number, expiring, HttpOnly and SameSite=Strict. Configuring
+an HTTPS public origin enables Secure, host-prefixed cookies. State-changing cookie
+requests require the session CSRF token and matching Origin. Referrer-Policy is
+`same-origin`: it suppresses cross-origin referrers while retaining the Origin on
+legitimate HTML form submissions (unlike `no-referrer`). MCP accepts explicit
+bearer credentials only; it never accepts browser session cookies.
 
-## Data model: immutability as a database property
+## Operations
 
-Three real tables, two FTS5 index tables ([src/db.ts](../src/db.ts)):
+IP ingress limits, credential request limits, login throttling, concurrency limits,
+and HTTP timeouts bound load. Forwarded headers are not trusted: behind a proxy,
+the IP limit applies to the proxy connection, while authenticated limits remain
+per identity. Only a configured public origin controls HTTPS cookie/Origin behavior.
 
-| Table | Holds | Can change? |
-|---|---|---|
-| `messages` | the single chat log | never |
-| `annotations` | flags targeting a message or document | never |
-| `documents` | named docs, one row per version | never |
-| `messages_fts`, `documents_fts` | full-text indexes | insert-triggers only |
+Metrics use fixed fields, with no raw URLs, query values or content labels. Capacity
+warning transitions emit sanitized JSON logs. The Docker image runs as non-root;
+Compose drops capabilities, uses a read-only root, rotates logs and bounds CPU,
+RAM and PIDs. Shutdown drains HTTP requests before closing SQLite, with a deadline.
 
-Append-only is **not an application policy** — every table carries `BEFORE UPDATE`
-and `BEFORE DELETE` triggers that `RAISE(ABORT)`. This is the lowest enforcement
-layer available: a refactor bug or someone opening the file with the `sqlite3` CLI
-cannot rewrite history without first dropping the triggers, which is itself a loud,
-deliberate act.
+`backup.ts` creates online SQLite backups, checks integrity and writes a SHA-256
+manifest. Restore refuses an existing destination. The checksum detects accidental
+corruption; tamper evidence against a database owner requires an independent trusted
+copy or external checkpoint. Back up credentials separately and keep backups off-host.
 
-Everything mutable-looking is built as appends:
+MCP supplies enforced mechanisms. `skill/SKILL.md` supplies the behavioral protocol:
+read all context, coordinate work, use safe retries, and treat room content as
+untrusted data. Neither component replaces the other.
 
-- "Editing" doesn't exist; you post a correction and flag the original `stale`.
-- "Updating" a document inserts `version = max(version) + 1` in a transaction; old
-  versions stay readable forever.
-- "Unpinning" is an append too: a message counts as pinned if it has a
-  `read-first` annotation with no `resolved` annotation bearing a **higher id**.
-  Comparing monotonic ids instead of deleting the pin means the pin/unpin history
-  is itself auditable.
 
-Annotations are one polymorphic table (a `CHECK` requires exactly one target,
-message or document), so a single flag vocabulary — `read-first`, `stale`,
-`outdated`, `failed`, `resolved`, `note` — works everywhere, for humans and agents
-alike.
+## Collaboration persistence and delivery
 
-## Search and retention
+Schema v3 adds thread roots, immutable record versions, append-only events,
+recipient attention state and wake/check-in leases. V4 adds per-PR source-check
+timestamps so refreshing unchanged provider descriptions does not grow history.
+Message insert, thread mapping and recipient events share the same transaction.
+Status ownership, expected versions, work claims and test-run commit identity are
+enforced by the domain. Dependency cycles are rejected. Boards project previews
+in SQL; full records use chunked JSON reads.
 
-FTS5 runs in external-content mode: the index references the base tables, and an
-`AFTER INSERT` trigger keeps it current. External-content FTS normally requires
-delete-tracking triggers — a whole class of corruption bugs — but since rows can
-never be deleted, those don't exist here. **Append-only made search simpler, not
-just the audit story.** Results rank by BM25; a query that fails FTS5 parsing
-(agents love pasting raw error strings) retries as an escaped literal phrase.
+`delivery.ts` provides bearer-only SSE independent of stateless MCP. Recipient
+cursors are durable event IDs; backpressure pauses sending, one stream per identity
+and four per room bound resource use, and 55-second rotation rechecks authentication.
+Shutdown closes streams before draining HTTP. The separate `runner.ts` combines
+SSE with five-second due-work checks, exclusive expiring leases, fixed-command
+execution and idempotent completion. Retries are at least once, not exactly once.
+The operator's runtime adapter must await the actual agent turn before success.
 
-Retention resolves the spec contradiction between "bounded retention" and "unable
-to delete": it is a **read-time filter, not a write-time purge**. With
-`ONEROOM_RETENTION_DAYS` set, default reads and searches exclude older messages;
-`include_archived: true` reveals them; nothing is removed. The size cap is what
-bounds disk, and it does so by refusing new writes, never by evicting old ones.
-
-## Human layer
-
-The audit UI ([src/ui.ts](../src/ui.ts)) is server-rendered HTML with zero
-JavaScript — one function that queries the Room and prints the page. No build step,
-nothing to break, works over an SSH tunnel. Humans get the same powers as agents
-through a different door: the annotate form writes to the same append-only table,
-and there is no delete control because the database wouldn't honor one. `/export`
-dumps everything as JSON.
-
-The last component isn't code: [skill/SKILL.md](../skill/SKILL.md) is the
-behavioral layer. The server guarantees what *can't* happen (deletion, unbounded
-growth, hidden channels); the skill teaches what *should* happen (catch up first,
-announce work, flag failures, resolve stale pins). Mechanism in the server, policy
-in the skill — the etiquette can evolve without redeploying.
-
-## Trade-offs, stated plainly
-
-- **Single writer, single node.** SQLite means no horizontal scaling. Right trade
-  for "my agents on my product"; the `Room` class is the seam where Postgres would
-  slot in if rooms-as-a-service ever mattered.
-- **No push.** An agent mid-task learns about new messages at its next checkpoint.
-  Fine for turn-based coding agents, wrong for real-time swarms.
-- **Self-reported identity.** Cooperative trust model, auditable by design.
-- **Plaintext HTTP.** TLS belongs to a reverse proxy or SSH tunnel, keeping cert
-  management out of the container.
-- **Append-only cuts both ways.** A leaked secret can't be scrubbed, only rotated.
-
-Deliberately absent — channels, threads-as-structure, file locking, multiple rooms,
-user accounts. Each is a fork in the road where existing tools (MCP Agent Mail's
-inboxes and leases, Agent-MCP's orchestration graph) already live. OneRoom's bet is
-that the smallest primitive — one immutable, searchable, bounded room — is the
-thing that was missing.
+`github.ts` only reads configured GitHub.com repositories. Failed/partial listings
+cannot infer closed PRs. CI source failures become unknown. Descriptions/metadata
+are source-owned, while PR notes retain authenticated agent ownership. Test evidence
+is selected by repository plus the PR snapshot's exact head SHA. Source checks,
+leases and attention are intentionally mutable; versioned content and events are not.

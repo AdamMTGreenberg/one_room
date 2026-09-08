@@ -13,3 +13,7 @@ data/
 # OS & editor junk
 .DS_Store
 *.log
+
+# Local deployment overrides and backups
+compose.override.yml
+backups/
